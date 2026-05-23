@@ -7,7 +7,7 @@ import random
 import string
 import time
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -31,7 +31,7 @@ from database import (
     create_ticket, add_ticket_message, close_ticket, update_ticket_status, verify_ticket_access,
     get_formatted_user_tickets, get_ticket_conversation, get_payment_info, update_payment_status,
     get_pending_payments, update_config_total_gb, get_all_configs_with_users,
-    get_service_policy
+    get_service_policy, update_app_settings
 )
 from menus import (
     VPN_PLANS, get_main_menu_keyboard, get_free_trial_keyboard, get_vpn_plans_keyboard,
@@ -493,6 +493,12 @@ async def handle_admin_callback(query, data, user_id, context: ContextTypes.DEFA
                 [InlineKeyboardButton("❌ انصراف", callback_data="admin_menu")]
             ])
         )
+    elif data == "admin_service_policy":
+        await show_service_policy(query)
+    elif data == "admin_service_policy_set_max_gb":
+        await prompt_service_policy_max_gb(query, context)
+    elif data == "admin_service_policy_set_expiry_date":
+        await prompt_service_policy_expiry_date(query, context)
     elif data.startswith("admin_view_ticket_"):
         ticket_id = int(data.split("_")[3])
         await show_ticket_messages_admin(query, ticket_id)
@@ -522,6 +528,64 @@ async def show_admin_menu(query):
         "🔐 پنل مدیریت\n\nلطفا یک گزینه را انتخاب کنید:",
         reply_markup=get_admin_menu_keyboard()
     )
+
+
+async def show_service_policy(query):
+    """Show the current service policy values."""
+    policy = get_service_policy()
+    max_config_gb = policy.get("max_config_gb", 0)
+    max_config_text = "نامحدود" if not max_config_gb else f"{max_config_gb:g} GB"
+
+    message = (
+        "📜 Service Policy\n\n"
+        f"حداکثر حجم هر کانفیگ: {max_config_text}\n"
+        f"تاریخ انقضای سراسری: {policy.get('global_expiry_date', 'نامشخص')}\n"
+        f"زمان انقضای ذخیره‌شده: {policy.get('global_expiry_time_ms', 'نامشخص')}\n"
+    )
+
+    await query.edit_message_text(
+        message,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✏️ تغییر حداکثر حجم هر کانفیگ", callback_data="admin_service_policy_set_max_gb")],
+            [InlineKeyboardButton("📅 تغییر تاریخ انقضای سراسری", callback_data="admin_service_policy_set_expiry_date")],
+            [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_menu")]
+        ])
+    )
+
+
+async def prompt_service_policy_max_gb(query, context: ContextTypes.DEFAULT_TYPE):
+    """Ask the admin for a new max GB value."""
+    policy = get_service_policy()
+    context.user_data["awaiting_service_policy_max_gb"] = True
+    context.user_data.pop("awaiting_service_policy_expiry_date", None)
+
+    max_config_gb = policy.get("max_config_gb", 0)
+    max_config_text = "نامحدود" if not max_config_gb else f"{max_config_gb:g} GB"
+
+    await query.edit_message_text(
+        f"حداکثر حجم فعلی هر کانفیگ: {max_config_text}\n\n"
+        "عدد جدید را به گیگابایت ارسال کنید.\n"
+        "برای نامحدود کردن، عدد 0 را بفرستید.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ انصراف", callback_data="admin_service_policy")]
+        ])
+    )
+
+
+async def prompt_service_policy_expiry_date(query, context: ContextTypes.DEFAULT_TYPE):
+    """Ask the admin for a new global expiry date."""
+    policy = get_service_policy()
+    context.user_data["awaiting_service_policy_expiry_date"] = True
+    context.user_data.pop("awaiting_service_policy_max_gb", None)
+
+    await query.edit_message_text(
+        f"تاریخ انقضای فعلی: {policy.get('global_expiry_date', 'نامشخص')}\n\n"
+        "تاریخ جدید را با فرمت YYYY-MM-DD ارسال کنید.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ انصراف", callback_data="admin_service_policy")]
+        ])
+    )
+
 async def show_buy_allow(query , data):
     """Show the admin menu"""
     import config
@@ -802,6 +866,36 @@ async def handle_support_message(update: Update, context: ContextTypes.DEFAULT_T
     """Handle text messages for support tickets"""
     user_id = update.effective_user.id
     message_text = update.message.text
+
+    if user_id in ADMIN_IDS and context.user_data.get("awaiting_service_policy_max_gb"):
+        try:
+            max_config_gb = float(message_text.strip())
+            if max_config_gb < 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text(
+                "عدد نامعتبر است. لطفاً یک عدد غیرمنفی برای حداکثر حجم ارسال کنید."
+            )
+            return
+
+        update_app_settings(max_config_gb=max_config_gb)
+        del context.user_data["awaiting_service_policy_max_gb"]
+        await update.message.reply_text("حداکثر حجم هر کانفیگ با موفقیت به‌روزرسانی شد.")
+        return
+
+    if user_id in ADMIN_IDS and context.user_data.get("awaiting_service_policy_expiry_date"):
+        try:
+            datetime.strptime(message_text.strip(), "%Y-%m-%d")
+        except ValueError:
+            await update.message.reply_text(
+                "فرمت تاریخ نامعتبر است. لطفاً تاریخ را با فرمت YYYY-MM-DD ارسال کنید."
+            )
+            return
+
+        update_app_settings(global_expiry_date=message_text.strip())
+        del context.user_data["awaiting_service_policy_expiry_date"]
+        await update.message.reply_text("تاریخ انقضای سراسری با موفقیت به‌روزرسانی شد.")
+        return
 
     # Check if admin is sending a broadcast message
     if user_id in ADMIN_IDS and context.user_data.get('awaiting_broadcast'):

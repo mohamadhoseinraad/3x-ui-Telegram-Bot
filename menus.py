@@ -131,6 +131,7 @@ def get_admin_menu_keyboard():
         [InlineKeyboardButton("🎫 تیکت‌های پشتیبانی", callback_data="admin_tickets")],
         [InlineKeyboardButton("👨‍💻 مدیریت کلاینت ها", callback_data="admin_manage_clients")],
         [InlineKeyboardButton("📢 ارسال پیام به همه", callback_data="admin_broadcast")],
+        [InlineKeyboardButton("📜 Service Policy", callback_data="admin_service_policy")],
         [InlineKeyboardButton("⏱️ تنظیم تاریخ انقضای همه کلاینت‌ها", callback_data="admin_extend_all")],
         [InlineKeyboardButton("فعال/غیر فعال سازی فروش", callback_data="admin_buy_allow")]
     ])
