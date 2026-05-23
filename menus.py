@@ -5,10 +5,10 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 # VPN plans
 VPN_PLANS = {
-    "gb_10": {"name": "آلمان 🇩🇪 10 گیگ / 1 ماهه 20 هزار تومن", "gb": 10},
-    "gb_30": {"name": "آلمان 🇩🇪 30 گیگ / 1 ماهه 60 هزار تومن", "gb": 30},
-    "gb_40": {"name": "آلمان 🇩🇪 40 گیگ / 1 ماهه 80 هزار تومن", "gb": 40},
-    "gb_50": {"name": "آلمان 🇩🇪 50 گیگ / 1 ماهه 100 هزار تومن", "gb": 50}
+    "gb_1": {"name": "1 Gb  تا زمان ", "gb": 1},
+    "gb_2": {"name": "2 Gb  تا زمان ", "gb": 2},
+    "gb_5": {"name": "5 Gb  تا زمان ", "gb": 5},
+    "gb_10": {"name": "10 Gb  تا زمان ", "gb": 10},
 }
 
 # Free trial plans
@@ -21,17 +21,17 @@ def get_free_trial_keyboard():
 # Regular VPN plans keyboard
 def get_vpn_plans_keyboard():
     return [
-        [InlineKeyboardButton("🇩🇪آلمان 10 گیگ / 1 ماهه 20 هزار تومن", callback_data="gb_10")],
-        [InlineKeyboardButton("🇩🇪آلمان 30 گیگ / 1 ماهه 60 هزار تومن", callback_data="gb_30")],
-        [InlineKeyboardButton("🇩🇪 آلمان 40 گیگ / 1 ماهه 80 هزار تومن", callback_data="gb_40")],
-        [InlineKeyboardButton("🇩🇪 آلمان 80 گیگ / 1 ماهه 100 هزار تومن", callback_data="gb_50")]
+        [InlineKeyboardButton("1 Gb  تا زمان  انتقضا()", callback_data="gb_1")],
+        [InlineKeyboardButton("2 Gb  تا زمان  انتقضا()", callback_data="gb_2")],
+        [InlineKeyboardButton("5 Gb  تا زمان  انتقضا()", callback_data="gb_5")],
+        [InlineKeyboardButton("10 Gb  تا زمان  انتقضا()", callback_data="gb_10")]
     ]
 def get_vpn_extend_plans_keyboard(email):
     keyboard = [
-        [InlineKeyboardButton("➕🇩🇪 آلمان 10 گیگ / 1 ماهه 20 هزار تومن", callback_data="extend_gb_10")],
-        [InlineKeyboardButton("➕🇩🇪 آلمان 30 گیگ / 1 ماهه 60 هزار تومن", callback_data="extend_gb_30")],
-        [InlineKeyboardButton("➕🇩🇪 آلمان 40 گیگ / 1 ماهه 80 هزار تومن", callback_data="extend_gb_40")],
-        [InlineKeyboardButton("➕🇩🇪 آلمان 50 گیگ / 1 ماهه 100 هزار تومن", callback_data="extend_gb_50")],
+        [InlineKeyboardButton("➕1 Gb  تا زمان  انتقضا(بدون تمدید زمانی)", callback_data="extend_gb_1")],
+        [InlineKeyboardButton("➕2 Gb  تا زمان  انتقضا(بدون تمدید زمانی)", callback_data="extend_gb_2")],
+        [InlineKeyboardButton("➕5 Gb  تا زمان  انتقضا(بدون تمدید زمانی)", callback_data="extend_gb_5")],
+        [InlineKeyboardButton("➕10 Gb  تا زمان  انتقضا(بدون تمدید زمانی)", callback_data="extend_gb_10")],
         [InlineKeyboardButton("🔙 بازگشت", callback_data=f"status_{email}")]
     ]
     return keyboard

@@ -1,0 +1,14 @@
+BOT_TOKEN=TELBOT_TOKEN
+ADMIN_IDS=TELEGRAM_USERID,TELEGRAM_USERID
+XUI_URL=https://domain:port/salt
+XUI_USERNAME=admin
+XUI_PASSWORD=secret
+INBOUND_ID=1
+IPDOMAIN=ip
+DOMAIN=domain
+HOST=domain
+SNI=domain
+PORT=443
+DB_FILE=xui_bot_.db
+ALLOW_BUY=true
+PAYMENT_MSG=for example your bank card number or payment link
