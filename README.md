@@ -47,6 +47,7 @@ Edit the `config.py` file to set up your environment:
 ## Project Structure
 
 - `bot.py`: Main bot application and command handlers
+- `app.py`: Flask web application with user/admin panels
 - `client_management.py`: Functions for managing VPN clients
 - `config.py`: Configuration settings
 - `database.py`: Database operations and schema
@@ -54,6 +55,8 @@ Edit the `config.py` file to set up your environment:
 - `menus.py`: Telegram inline keyboard menus
 - `notification_service.py`: Automated notification system
 - `xui_api.py`: API interactions with the XUI panel
+- `templates/`: HTML templates for the web app
+- `static/`: CSS for the web app
 
 ## Usage
 
@@ -66,6 +69,29 @@ Edit the `config.py` file to set up your environment:
    - `/start` - Initialize the bot
    - `/help` - Show help information
    - Additional commands as configured in the bot
+
+## Web App Usage
+
+You can run a web version of the same management flows:
+
+1. Install web dependencies:
+   ```
+   pip install -r requirements-web.txt
+   ```
+2. Start the web app:
+   ```
+   python app.py
+   ```
+3. Open:
+   ```
+   http://127.0.0.1:5000
+   ```
+
+### Web App Notes
+
+- Login is a simple user-id based flow to match the bot's `user_id` model.
+- Admin access is controlled by `ADMIN_IDS` in `config.py`.
+- Payment receipt in web is a text/reference field (instead of Telegram file IDs).
 
 ## Admin Commands
 

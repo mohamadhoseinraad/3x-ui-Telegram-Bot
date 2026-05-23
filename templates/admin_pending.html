@@ -1,0 +1,41 @@
+{% extends 'base.html' %}
+{% block content %}
+<section class="card">
+  <h2>Pending Payments</h2>
+  {% if not pending %}
+    <p>No pending payments.</p>
+  {% else %}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>User</th>
+          <th>Plan</th>
+          <th>Receipt</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for p in pending %}
+        <tr>
+          <td>{{ p[0] }}</td>
+          <td>{{ p[3] }} {% if p[4] %}(@{{ p[4] }}){% endif %}</td>
+          <td>{{ p[2] }}</td>
+          <td><textarea rows="2" readonly>{{ p[5] }}</textarea></td>
+          <td>
+            <form method="post" action="{{ url_for('approve_payment_web', payment_id=p[0]) }}" class="inline-form">
+              <button type="submit">Approve</button>
+            </form>
+            <form method="post" action="{{ url_for('reject_payment_web', payment_id=p[0]) }}" class="inline-form">
+              <button type="submit" class="danger">Reject</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+</section>
+{% endblock %}

@@ -1,0 +1,32 @@
+{% extends 'base.html' %}
+{% block content %}
+<section class="card">
+  <h2>Admin Dashboard</h2>
+  <div class="actions">
+    <a class="btn" href="{{ url_for('admin_pending') }}">Pending Payments</a>
+    <a class="btn" href="{{ url_for('admin_users') }}">Users</a>
+    <a class="btn" href="{{ url_for('admin_tickets') }}">Tickets</a>
+    <a class="btn" href="{{ url_for('admin_clients') }}">Clients</a>
+  </div>
+</section>
+
+<section class="card">
+  <h3>Extend All Clients</h3>
+  <form method="post" action="{{ url_for('admin_extend_all') }}" class="inline-form">
+    <select name="days">
+      <option value="1">1 day</option>
+      <option value="3">3 days</option>
+      <option value="10">10 days</option>
+    </select>
+    <button type="submit">Run Extend</button>
+  </form>
+</section>
+
+<section class="card">
+  <h3>Toggle Buying</h3>
+  <form method="post" action="{{ url_for('admin_toggle_buy') }}" class="inline-form">
+    <button type="submit" name="enabled" value="yes">Enable</button>
+    <button type="submit" name="enabled" value="no" class="danger">Disable</button>
+  </form>
+</section>
+{% endblock %}

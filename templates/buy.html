@@ -1,0 +1,24 @@
+{% extends 'base.html' %}
+{% block content %}
+<section class="card narrow">
+  <h2>Buy Service</h2>
+  {% if not allow_buy %}
+    <p class="warn">Buying is disabled by admin right now.</p>
+  {% else %}
+    <form method="post" class="grid-form">
+      <label>Plan
+        <select name="plan_key" required>
+          {% for key, plan in plans.items() %}
+          <option value="{{ key }}">{{ plan.name }} ({{ plan.gb }}GB)</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>Receipt / Payment Reference
+        <input type="text" name="receipt" required>
+      </label>
+      <button type="submit">Submit Payment Request</button>
+    </form>
+    <p class="hint">{{ payment_msg }}</p>
+  {% endif %}
+</section>
+{% endblock %}

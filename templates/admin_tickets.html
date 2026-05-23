@@ -1,0 +1,19 @@
+{% extends 'base.html' %}
+{% block content %}
+<section class="card">
+  <h2>Support Tickets</h2>
+  {% if not tickets %}
+    <p>No tickets found.</p>
+  {% else %}
+    <ul class="list">
+      {% for t in tickets %}
+      <li>
+        <a href="{{ url_for('ticket_detail', ticket_id=t['ticket_id']) }}">#{{ t['ticket_id'] }} - {{ t['subject'] }}</a>
+        <span class="badge">{{ t['status'] }}</span>
+        <small>{{ t['first_name'] }} {% if t['username'] %}(@{{ t['username'] }}){% endif %}</small>
+      </li>
+      {% endfor %}
+    </ul>
+  {% endif %}
+</section>
+{% endblock %}

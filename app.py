@@ -1,0 +1,608 @@
+"""
+Web application for managing VPN services with the same core flows as the Telegram bot.
+"""
+
+import logging
+import random
+import sqlite3
+import string
+import time
+import uuid
+from datetime import timedelta
+from functools import wraps
+
+from flask import Flask, flash, redirect, render_template, request, session, url_for
+
+import config
+from config import ADMIN_IDS, DB_FILE, HOST, IPDOMAIN, PORT, SNI, payment_msg
+from database import (
+    add_ticket_message,
+    check_trial_usage,
+    close_ticket,
+    create_ticket,
+    get_all_configs_with_users,
+    get_or_create_user,
+    get_payment_info,
+    get_pending_payments,
+    get_ticket_conversation,
+    get_user_configs,
+    get_user_tickets,
+    init_db,
+    save_new_config,
+    save_payment_request,
+    update_config_active_status,
+    update_config_total_gb,
+    update_payment_status,
+    update_ticket_status,
+    verify_ticket_access,
+)
+from db_utils import delete_config_by_client_id, get_all_db_configs
+from menus import VPN_PLANS
+from xui_api import create_client, delete_client, extend_client, get_all_clients, get_client_status
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+app.secret_key = "replace-this-with-a-secure-secret"
+
+
+@app.context_processor
+def inject_globals():
+    return {"ADMIN_IDS": ADMIN_IDS}
+
+
+def random_suffix(length=6):
+    return "".join(random.choices(string.ascii_lowercase + string.digits, k=length))
+
+
+def generate_vless_link(client_id, email):
+    return (
+        f"vless://{client_id}@{IPDOMAIN}:{PORT}"
+        f"?type=ws&path=%2F&host={HOST}&security=tls&fp=firefox&alpn=h3%2Ch2%2Chttp%2F1.1&sni={SNI}"
+        f"#{email}"
+    )
+
+
+def current_user_id():
+    return session.get("user_id")
+
+
+def is_admin():
+    uid = current_user_id()
+    return uid in ADMIN_IDS if uid is not None else False
+
+
+def login_required(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        if current_user_id() is None:
+            return redirect(url_for("login"))
+        return func(*args, **kwargs)
+
+    return wrapper
+
+
+def admin_required(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        if not is_admin():
+            flash("You do not have access to admin features.", "error")
+            return redirect(url_for("dashboard"))
+        return func(*args, **kwargs)
+
+    return wrapper
+
+
+def _parse_plan_gb(plan_name):
+    first = plan_name.split()[0]
+    if first.isdigit():
+        return int(first)
+    # Extension format: "تمدید 10GB"
+    digits = "".join(ch for ch in plan_name if ch.isdigit())
+    return int(digits) if digits else 0
+
+
+def _db_connection():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+@app.route("/")
+def home():
+    if current_user_id() is None:
+        return redirect(url_for("login"))
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        raw_user_id = request.form.get("user_id", "").strip()
+        username = request.form.get("username", "").strip() or None
+        first_name = request.form.get("first_name", "").strip() or "WebUser"
+        last_name = request.form.get("last_name", "").strip() or None
+
+        if not raw_user_id.isdigit():
+            flash("User ID must be numeric.", "error")
+            return render_template("login.html")
+
+        user_id = int(raw_user_id)
+        get_or_create_user(user_id, username, first_name, last_name)
+
+        session["user_id"] = user_id
+        session["username"] = username
+        flash("Signed in successfully.", "success")
+        return redirect(url_for("dashboard"))
+
+    return render_template("login.html")
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    flash("You have been signed out.", "success")
+    return redirect(url_for("login"))
+
+
+@app.route("/dashboard")
+@login_required
+def dashboard():
+    return render_template(
+        "dashboard.html",
+        is_admin_user=is_admin(),
+        allow_buy=config.ALLOW_BUY,
+    )
+
+
+@app.route("/configs")
+@login_required
+def configs_view():
+    user_id = current_user_id()
+    configs = get_user_configs(user_id)
+
+    rendered = []
+    for conf in configs:
+        _config_id, email, client_id, total_gb, _active = conf
+        status = get_client_status(email)
+        if status:
+            update_config_active_status(email, user_id, status["is_active"])
+            rendered.append(
+                {
+                    "email": email,
+                    "client_id": client_id,
+                    "total_gb": status["total_gb"],
+                    "remaining_gb": status["remaining_gb"],
+                    "remaining_time_display": status["remaining_time_display"],
+                    "expiry_date": status["expiry_date"],
+                    "is_active": status["is_active"],
+                    "vless_link": generate_vless_link(client_id, email),
+                }
+            )
+        else:
+            rendered.append(
+                {
+                    "email": email,
+                    "client_id": client_id,
+                    "total_gb": total_gb,
+                    "remaining_gb": "-",
+                    "remaining_time_display": "Unknown",
+                    "expiry_date": "Unknown",
+                    "is_active": False,
+                    "vless_link": generate_vless_link(client_id, email),
+                }
+            )
+
+    return render_template("configs.html", configs=rendered)
+
+
+@app.route("/free-trial", methods=["POST"])
+@login_required
+def free_trial():
+    user_id = current_user_id()
+    trial_size = request.form.get("trial_size", "")
+
+    if trial_size not in {"1", "5"}:
+        flash("Invalid trial option.", "error")
+        return redirect(url_for("dashboard"))
+
+    gb_amount = int(trial_size)
+    if check_trial_usage(user_id, gb_amount):
+        flash(f"You already used the {gb_amount}GB trial.", "error")
+        return redirect(url_for("dashboard"))
+
+    suffix = random_suffix()
+    username = session.get("username") or f"u{user_id}"
+    email = f"{username}_{suffix}@free"
+    if len(email) > 50:
+        email = f"u{user_id}_{suffix}@free_{gb_amount}_gb"
+
+    total_bytes = gb_amount * (1024 ** 3)
+    days = 1 if gb_amount == 1 else 7
+    expiry_time = int(time.time() + days * 86400) * 1000
+
+    client_id, error = create_client(email, total_bytes, expiry_time)
+    if error:
+        flash(f"Failed to create trial: {error}", "error")
+        return redirect(url_for("dashboard"))
+
+    save_new_config(user_id, email, client_id, gb_amount)
+    vless_link = generate_vless_link(client_id, email)
+    flash(f"Trial created. Config: {vless_link}", "success")
+    return redirect(url_for("configs_view"))
+
+
+@app.route("/buy", methods=["GET", "POST"])
+@login_required
+def buy_service():
+    if request.method == "POST":
+        if not config.ALLOW_BUY:
+            flash("Buying is currently disabled.", "error")
+            return redirect(url_for("buy_service"))
+
+        plan_key = request.form.get("plan_key", "")
+        receipt_text = request.form.get("receipt", "").strip()
+
+        if plan_key not in VPN_PLANS:
+            flash("Invalid plan.", "error")
+            return redirect(url_for("buy_service"))
+
+        if not receipt_text:
+            flash("Receipt/reference is required.", "error")
+            return redirect(url_for("buy_service"))
+
+        plan = VPN_PLANS[plan_key]
+        payment_id = save_payment_request(current_user_id(), plan["name"], receipt_text)
+        flash(f"Payment request #{payment_id} submitted and waiting for admin approval.", "success")
+        return redirect(url_for("dashboard"))
+
+    return render_template(
+        "buy.html",
+        plans=VPN_PLANS,
+        allow_buy=config.ALLOW_BUY,
+        payment_msg=payment_msg,
+    )
+
+
+@app.route("/extend", methods=["POST"])
+@login_required
+def extend_config_request():
+    if not config.ALLOW_BUY:
+        flash("Buying is currently disabled.", "error")
+        return redirect(url_for("configs_view"))
+
+    user_id = current_user_id()
+    email = request.form.get("email", "").strip()
+    gb_amount_raw = request.form.get("gb_amount", "").strip()
+    receipt_text = request.form.get("receipt", "").strip()
+
+    if not gb_amount_raw.isdigit() or not receipt_text:
+        flash("Invalid extension request.", "error")
+        return redirect(url_for("configs_view"))
+
+    gb_amount = int(gb_amount_raw)
+    client_id = None
+    for conf in get_user_configs(user_id):
+        if conf[1] == email:
+            client_id = conf[2]
+            break
+
+    if not client_id:
+        flash("Config not found.", "error")
+        return redirect(url_for("configs_view"))
+
+    # Keep extension details encoded in plan+receipt so it survives process restarts.
+    plan_name = f"تمدید {gb_amount}GB"
+    receipt_payload = f"EXT::{email}::{client_id}::{receipt_text}"
+
+    payment_id = save_payment_request(user_id, plan_name, receipt_payload)
+    flash(f"Extension payment request #{payment_id} submitted.", "success")
+    return redirect(url_for("configs_view"))
+
+
+@app.route("/support", methods=["GET", "POST"])
+@login_required
+def support():
+    user_id = current_user_id()
+
+    if request.method == "POST":
+        subject = request.form.get("subject", "").strip()
+        if not subject:
+            flash("Ticket subject is required.", "error")
+            return redirect(url_for("support"))
+
+        ticket_id = create_ticket(user_id, subject)
+        add_ticket_message(ticket_id, user_id, subject, False)
+        flash(f"Ticket #{ticket_id} created.", "success")
+        return redirect(url_for("ticket_detail", ticket_id=ticket_id))
+
+    tickets = get_user_tickets(user_id)
+    return render_template("support.html", tickets=tickets)
+
+
+@app.route("/support/<int:ticket_id>", methods=["GET", "POST"])
+@login_required
+def ticket_detail(ticket_id):
+    user_id = current_user_id()
+
+    data = get_ticket_conversation(ticket_id, user_id, ADMIN_IDS)
+    if not data.get("access"):
+        flash("Access denied.", "error")
+        return redirect(url_for("support"))
+
+    if request.method == "POST":
+        action = request.form.get("action", "reply")
+
+        if action == "close":
+            has_access, _owner = verify_ticket_access(ticket_id, user_id, ADMIN_IDS)
+            if not has_access:
+                flash("Access denied.", "error")
+                return redirect(url_for("support"))
+
+            close_ticket(ticket_id)
+            flash("Ticket closed.", "success")
+            return redirect(url_for("ticket_detail", ticket_id=ticket_id))
+
+        reply_text = request.form.get("message", "").strip()
+        if not reply_text:
+            flash("Reply cannot be empty.", "error")
+            return redirect(url_for("ticket_detail", ticket_id=ticket_id))
+
+        is_admin_sender = user_id in ADMIN_IDS
+        add_ticket_message(ticket_id, user_id, reply_text, is_admin_sender)
+        update_ticket_status(ticket_id, "answered" if is_admin_sender else "open")
+        flash("Reply sent.", "success")
+        return redirect(url_for("ticket_detail", ticket_id=ticket_id))
+
+    return render_template(
+        "ticket_detail.html",
+        ticket_id=ticket_id,
+        ticket_data=data,
+        is_admin_user=is_admin(),
+    )
+
+
+@app.route("/admin")
+@login_required
+@admin_required
+def admin_dashboard():
+    return render_template("admin_dashboard.html")
+
+
+@app.route("/admin/pending")
+@login_required
+@admin_required
+def admin_pending():
+    pending = get_pending_payments()
+    return render_template("admin_pending.html", pending=pending)
+
+
+@app.route("/admin/pending/<int:payment_id>/approve", methods=["POST"])
+@login_required
+@admin_required
+def approve_payment_web(payment_id):
+    payment_info = get_payment_info(payment_id)
+    if not payment_info:
+        flash("Payment not found or already processed.", "error")
+        return redirect(url_for("admin_pending"))
+
+    user_id, plan_name, username = payment_info
+    plan_gb = _parse_plan_gb(plan_name)
+
+    conn = _db_connection()
+    payment_row = conn.execute(
+        "SELECT receipt_file_id FROM payments WHERE payment_id = ?",
+        (payment_id,),
+    ).fetchone()
+    conn.close()
+
+    receipt_value = payment_row["receipt_file_id"] if payment_row else ""
+    is_extension = receipt_value.startswith("EXT::")
+
+    try:
+        if is_extension:
+            _prefix, email, client_id, _receipt_ref = receipt_value.split("::", 3)
+            success, error_msg = extend_client(email, client_id, plan_gb, timedelta(days=30))
+            if not success:
+                raise RuntimeError(error_msg or "Failed to extend client")
+
+            update_config_total_gb(email, user_id, plan_gb)
+            update_payment_status(payment_id, "approved")
+            flash(f"Extension approved for {email}.", "success")
+        else:
+            suffix = random_suffix()
+            user_identifier = username if username else str(user_id)
+            email = f"{user_identifier}_{suffix}@vpn"
+            if len(email) > 50:
+                email = f"u{user_id}_{suffix}@vpn"
+
+            total_bytes = plan_gb * (1024 ** 3)
+            expiry_time = int(time.time() + 30 * 86400) * 1000
+
+            client_id, error = create_client(email, total_bytes, expiry_time)
+            if error:
+                raise RuntimeError(error)
+
+            save_new_config(user_id, email, client_id, plan_gb)
+            update_payment_status(payment_id, "approved")
+            flash(f"Payment #{payment_id} approved and config created.", "success")
+
+    except Exception as exc:
+        logger.exception("Error approving payment")
+        flash(f"Error approving payment: {exc}", "error")
+
+    return redirect(url_for("admin_pending"))
+
+
+@app.route("/admin/pending/<int:payment_id>/reject", methods=["POST"])
+@login_required
+@admin_required
+def reject_payment_web(payment_id):
+    payment_info = get_payment_info(payment_id)
+    if not payment_info:
+        flash("Payment not found or already processed.", "error")
+        return redirect(url_for("admin_pending"))
+
+    update_payment_status(payment_id, "rejected")
+    flash(f"Payment #{payment_id} rejected.", "success")
+    return redirect(url_for("admin_pending"))
+
+
+@app.route("/admin/users")
+@login_required
+@admin_required
+def admin_users():
+    conn = _db_connection()
+    users = conn.execute(
+        """
+        SELECT u.user_id, u.first_name, u.username, COUNT(c.config_id) AS config_count, MAX(c.created_at) AS last_created
+        FROM users u
+        LEFT JOIN configs c ON u.user_id = c.user_id
+        GROUP BY u.user_id
+        ORDER BY last_created DESC
+        LIMIT 100
+        """
+    ).fetchall()
+    conn.close()
+    return render_template("admin_users.html", users=users)
+
+
+@app.route("/admin/tickets")
+@login_required
+@admin_required
+def admin_tickets():
+    conn = _db_connection()
+    tickets = conn.execute(
+        """
+        SELECT t.ticket_id, t.subject, t.status, u.first_name, u.username
+        FROM tickets t
+        JOIN users u ON t.user_id = u.user_id
+        ORDER BY
+            CASE
+                WHEN t.status = 'open' THEN 1
+                WHEN t.status = 'answered' THEN 2
+                ELSE 3
+            END,
+            t.created_at DESC
+        LIMIT 100
+        """
+    ).fetchall()
+    conn.close()
+    return render_template("admin_tickets.html", tickets=tickets)
+
+
+@app.route("/admin/clients")
+@login_required
+@admin_required
+def admin_clients():
+    xui_clients = get_all_clients() or []
+    db_clients = get_all_db_configs() or []
+
+    merged = {}
+    for client in xui_clients:
+        cid = client.get("id")
+        if not cid:
+            continue
+        merged[cid] = {
+            "client_id": cid,
+            "email": client.get("email"),
+            "remaining_gb": client.get("remaining_gb", "-"),
+            "total_gb": client.get("total_gb", "-"),
+            "expiry_date": client.get("expiry_date", "Unknown"),
+            "remaining_time_display": client.get("remaining_time_display", "Unknown"),
+            "is_active": client.get("is_active", client.get("enable", False)),
+            "source": "xui",
+        }
+
+    for db_client in db_clients:
+        cid = db_client.get("client_id")
+        if not cid:
+            continue
+        if cid in merged:
+            merged[cid].update(
+                {
+                    "user_id": db_client.get("user_id"),
+                    "username": db_client.get("username"),
+                    "first_name": db_client.get("first_name"),
+                    "source": "both",
+                }
+            )
+        else:
+            merged[cid] = {
+                "client_id": cid,
+                "email": db_client.get("email"),
+                "remaining_gb": "-",
+                "total_gb": db_client.get("total_gb"),
+                "expiry_date": "Unknown",
+                "remaining_time_display": "Unknown",
+                "is_active": bool(db_client.get("is_active")),
+                "user_id": db_client.get("user_id"),
+                "username": db_client.get("username"),
+                "first_name": db_client.get("first_name"),
+                "source": "db",
+            }
+
+    clients = sorted(list(merged.values()), key=lambda item: item.get("email") or "")
+    return render_template("admin_clients.html", clients=clients)
+
+
+@app.route("/admin/clients/<client_id>/delete", methods=["POST"])
+@login_required
+@admin_required
+def admin_delete_client(client_id):
+    xui_ok, xui_error = delete_client(client_id)
+    db_ok = delete_config_by_client_id(client_id)
+
+    if xui_ok:
+        message = f"Client {client_id[:8]}... deleted from XUI"
+        if db_ok:
+            message += " and database."
+        else:
+            message += ", but database cleanup failed."
+        flash(message, "success")
+    else:
+        flash(f"Failed to delete from XUI: {xui_error}", "error")
+
+    return redirect(url_for("admin_clients"))
+
+
+@app.route("/admin/extend-all", methods=["POST"])
+@login_required
+@admin_required
+def admin_extend_all():
+    days_raw = request.form.get("days", "")
+    if not days_raw.isdigit():
+        flash("Invalid day count.", "error")
+        return redirect(url_for("admin_dashboard"))
+
+    days = int(days_raw)
+    configs = get_all_configs_with_users()
+    updated = 0
+
+    for conf in configs:
+        email = conf["email"]
+        client_id = conf["client_id"]
+        user_id = conf["user_id"]
+        success, _error = extend_client(email, client_id, 0, timedelta(days=days))
+        db_ok = update_config_total_gb(email, user_id, 0)
+        if success and db_ok:
+            updated += 1
+
+    flash(f"Extended {updated} clients by {days} days.", "success")
+    return redirect(url_for("admin_dashboard"))
+
+
+@app.route("/admin/toggle-buy", methods=["POST"])
+@login_required
+@admin_required
+def admin_toggle_buy():
+    enabled = request.form.get("enabled", "no") == "yes"
+    config.ALLOW_BUY = enabled
+    flash(f"Buying is now {'enabled' if enabled else 'disabled' }.", "success")
+    return redirect(url_for("admin_dashboard"))
+
+
+if __name__ == "__main__":
+    init_db()
+    app.run(host="0.0.0.0", port=5000, debug=True)

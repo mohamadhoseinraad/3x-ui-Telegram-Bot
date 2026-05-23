@@ -1,0 +1,42 @@
+{% extends 'base.html' %}
+{% block content %}
+<section class="card">
+  <h2>Clients</h2>
+  {% if not clients %}
+    <p>No clients found.</p>
+  {% else %}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Email</th>
+          <th>Status</th>
+          <th>Remaining / Total</th>
+          <th>Expiry</th>
+          <th>Owner</th>
+          <th>Source</th>
+          <th>Action</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for c in clients %}
+        <tr>
+          <td>{{ c.email }}</td>
+          <td>{{ 'Active' if c.is_active else 'Disabled' }}</td>
+          <td>{{ c.remaining_gb }} / {{ c.total_gb }} GB</td>
+          <td>{{ c.expiry_date }} ({{ c.remaining_time_display }})</td>
+          <td>{{ c.first_name or '-' }} {% if c.username %}(@{{ c.username }}){% endif %}</td>
+          <td>{{ c.source }}</td>
+          <td>
+            <form method="post" action="{{ url_for('admin_delete_client', client_id=c.client_id) }}">
+              <button type="submit" class="danger">Delete</button>
+            </form>
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+</section>
+{% endblock %}

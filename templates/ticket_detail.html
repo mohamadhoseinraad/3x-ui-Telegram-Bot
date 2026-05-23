@@ -1,0 +1,30 @@
+{% extends 'base.html' %}
+{% block content %}
+<section class="card">
+  <h2>Ticket #{{ ticket_id }}</h2>
+  <p>Status: <strong>{{ ticket_data.status }}</strong></p>
+
+  <div class="messages">
+    {% for msg in ticket_data.messages %}
+      <article class="msg {{ 'admin' if msg[1] else 'user' }}">
+        <header>{{ 'Support' if msg[1] else 'User' }} - {{ msg[2] }}</header>
+        <p>{{ msg[0] }}</p>
+      </article>
+    {% endfor %}
+  </div>
+
+  <form method="post" class="grid-form">
+    <label>Reply
+      <textarea name="message" rows="4" required></textarea>
+    </label>
+    <button type="submit">Send Reply</button>
+  </form>
+
+  {% if ticket_data.status != 'closed' %}
+  <form method="post" class="inline-form">
+    <input type="hidden" name="action" value="close">
+    <button type="submit" class="danger">Close Ticket</button>
+  </form>
+  {% endif %}
+</section>
+{% endblock %}

@@ -1,0 +1,28 @@
+{% extends 'base.html' %}
+{% block content %}
+<section class="card">
+  <h2>Support</h2>
+  <form method="post" class="grid-form">
+    <label>New Ticket Subject
+      <input type="text" name="subject" required>
+    </label>
+    <button type="submit">Create Ticket</button>
+  </form>
+</section>
+
+<section class="card">
+  <h3>My Tickets</h3>
+  {% if not tickets %}
+    <p>You have no tickets yet.</p>
+  {% else %}
+    <ul class="list">
+      {% for t in tickets %}
+      <li>
+        <a href="{{ url_for('ticket_detail', ticket_id=t[0]) }}">#{{ t[0] }} - {{ t[1] }}</a>
+        <span class="badge">{{ t[2] }}</span>
+      </li>
+      {% endfor %}
+    </ul>
+  {% endif %}
+</section>
+{% endblock %}

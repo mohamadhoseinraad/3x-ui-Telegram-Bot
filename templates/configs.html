@@ -1,0 +1,53 @@
+{% extends 'base.html' %}
+{% block content %}
+<section class="card">
+  <h2>Your Configurations</h2>
+  {% if not configs %}
+    <p>No services found for your account.</p>
+  {% else %}
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Email</th>
+            <th>Status</th>
+            <th>Remaining</th>
+            <th>Total</th>
+            <th>Time</th>
+            <th>Expiry</th>
+            <th>Link</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for c in configs %}
+          <tr>
+            <td>{{ c.email }}</td>
+            <td>{{ 'Active' if c.is_active else 'Disabled' }}</td>
+            <td>{{ c.remaining_gb }} GB</td>
+            <td>{{ c.total_gb }} GB</td>
+            <td>{{ c.remaining_time_display }}</td>
+            <td>{{ c.expiry_date }}</td>
+            <td><textarea rows="2" readonly>{{ c.vless_link }}</textarea></td>
+          </tr>
+          <tr>
+            <td colspan="7">
+              <form method="post" action="{{ url_for('extend_config_request') }}" class="inline-form">
+                <input type="hidden" name="email" value="{{ c.email }}">
+                <select name="gb_amount" required>
+                  <option value="10">Extend +10GB</option>
+                  <option value="30">Extend +30GB</option>
+                  <option value="40">Extend +40GB</option>
+                  <option value="50">Extend +50GB</option>
+                </select>
+                <input type="text" name="receipt" placeholder="Payment receipt/reference" required>
+                <button type="submit">Submit Extension Request</button>
+              </form>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+</section>
+{% endblock %}
