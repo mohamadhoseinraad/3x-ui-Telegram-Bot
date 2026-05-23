@@ -1,22 +1,24 @@
 {% extends 'base.html' %}
 {% block content %}
 <section class="card narrow">
-  <h2>Sign In</h2>
-  <p>Use your numeric user ID (same identity style as Telegram user IDs).</p>
+  <h2>{{ t('sign_in') }}</h2>
+  <p>{{ t('login_note') }}</p>
   <form method="post" class="grid-form">
-    <label>User ID
-      <input type="text" name="user_id" required>
+    <label>{{ t('username_label') }}
+      <input type="text" name="username" required autocomplete="username">
     </label>
-    <label>Username (optional)
-      <input type="text" name="username">
+    <label>{{ t('password_label') }}
+      <input type="password" name="password" required autocomplete="current-password">
     </label>
-    <label>First Name
-      <input type="text" name="first_name" required>
+    <label>{{ t('invite_code_label') }}
+      <input type="text" name="invite_code" autocomplete="one-time-code">
     </label>
-    <label>Last Name (optional)
-      <input type="text" name="last_name">
+    <label>{{ t('contact_info_label') }}
+      <input type="text" name="contact_info" placeholder="{{ t('contact_info_placeholder') }}">
     </label>
-    <button type="submit">Sign In</button>
+    <p class="form-hint">{{ t('contact_info_hint') }}</p>
+    <p class="form-hint">{{ t('invite_code_hint') }}</p>
+    <button type="submit">{{ t('sign_in') }}</button>
   </form>
 </section>
 {% endblock %}

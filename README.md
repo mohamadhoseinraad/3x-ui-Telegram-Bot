@@ -89,7 +89,7 @@ You can run a web version of the same management flows:
 
 ### Web App Notes
 
-- Login is a simple user-id based flow to match the bot's `user_id` model.
+- Login now uses a web username and password. On the first login, you can also provide a Telegram ID, phone number, or Telegram username once to link the account to the bot-side user record.
 - Admin access is controlled by `ADMIN_IDS` in `config.py`.
 - Payment receipt in web is a text/reference field (instead of Telegram file IDs).
 

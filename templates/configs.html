@@ -1,21 +1,21 @@
 {% extends 'base.html' %}
 {% block content %}
 <section class="card">
-  <h2>Your Configurations</h2>
+  <h2>{{ t('your_configs') }}</h2>
   {% if not configs %}
-    <p>No services found for your account.</p>
+    <p>{{ t('no_services') }}</p>
   {% else %}
     <div class="table-wrap">
       <table>
         <thead>
           <tr>
-            <th>Email</th>
-            <th>Status</th>
-            <th>Remaining</th>
-            <th>Total</th>
-            <th>Time</th>
-            <th>Expiry</th>
-            <th>Link</th>
+            <th>{{ t('email') }}</th>
+            <th>{{ t('status') }}</th>
+            <th>{{ t('remaining') }}</th>
+            <th>{{ t('total') }}</th>
+            <th>{{ t('time') }}</th>
+            <th>{{ t('expiry') }}</th>
+            <th>{{ t('link') }}</th>
           </tr>
         </thead>
         <tbody>
@@ -39,8 +39,8 @@
                   <option value="40">Extend +40GB</option>
                   <option value="50">Extend +50GB</option>
                 </select>
-                <input type="text" name="receipt" placeholder="Payment receipt/reference" required>
-                <button type="submit">Submit Extension Request</button>
+                <input type="text" name="receipt" placeholder="{{ t('receipt_hint') }}" required>
+                <button type="submit">{{ t('submit_extension') }}</button>
               </form>
             </td>
           </tr>

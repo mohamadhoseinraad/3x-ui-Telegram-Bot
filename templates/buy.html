@@ -1,22 +1,22 @@
 {% extends 'base.html' %}
 {% block content %}
 <section class="card narrow">
-  <h2>Buy Service</h2>
+  <h2>{{ t('buy_service') }}</h2>
   {% if not allow_buy %}
-    <p class="warn">Buying is disabled by admin right now.</p>
+    <p class="warn">{{ t('sales_disabled') }}</p>
   {% else %}
     <form method="post" class="grid-form">
-      <label>Plan
+      <label>{{ t('buy_service') }}
         <select name="plan_key" required>
           {% for key, plan in plans.items() %}
           <option value="{{ key }}">{{ plan.name }} ({{ plan.gb }}GB)</option>
           {% endfor %}
         </select>
       </label>
-      <label>Receipt / Payment Reference
+      <label>{{ t('receipt_hint') }}
         <input type="text" name="receipt" required>
       </label>
-      <button type="submit">Submit Payment Request</button>
+      <button type="submit">{{ t('buy_service') }}</button>
     </form>
     <p class="hint">{{ payment_msg }}</p>
   {% endif %}

@@ -1,12 +1,54 @@
 {% extends 'base.html' %}
 {% block content %}
 <section class="card">
-  <h2>Admin Dashboard</h2>
+  <h2>{{ t('admin_dashboard') }}</h2>
   <div class="actions">
-    <a class="btn" href="{{ url_for('admin_pending') }}">Pending Payments</a>
-    <a class="btn" href="{{ url_for('admin_users') }}">Users</a>
-    <a class="btn" href="{{ url_for('admin_tickets') }}">Tickets</a>
-    <a class="btn" href="{{ url_for('admin_clients') }}">Clients</a>
+    <a class="btn" href="{{ url_for('admin_pending') }}">{{ t('pending_payments') }}</a>
+    <a class="btn" href="{{ url_for('admin_users') }}">{{ t('users') }}</a>
+    <a class="btn" href="{{ url_for('admin_tickets') }}">{{ t('tickets') }}</a>
+    <a class="btn" href="{{ url_for('admin_clients') }}">{{ t('clients') }}</a>
+  </div>
+</section>
+
+<section class="card">
+  <h3>Invite Codes</h3>
+  <form method="post" action="{{ url_for('admin_create_invite_code') }}" class="inline-form">
+    <label>
+      Code length
+      <select name="code_length">
+        <option value="8">8</option>
+        <option value="10" selected>10</option>
+        <option value="12">12</option>
+      </select>
+    </label>
+    <button type="submit">Generate Invite Code</button>
+  </form>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Code</th>
+          <th>Status</th>
+          <th>Used By</th>
+          <th>Created</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for invite in invite_codes %}
+        <tr>
+          <td>{{ invite.code }}</td>
+          <td>{{ 'Active' if invite.is_active and not invite.used_at else 'Used' }}</td>
+          <td>{{ invite.used_by_username or '-' }}</td>
+          <td>{{ invite.created_at }}</td>
+        </tr>
+        {% else %}
+        <tr>
+          <td colspan="4">No invite codes yet.</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
   </div>
 </section>
 

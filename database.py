@@ -24,6 +24,32 @@ def init_db():
     ''')
 
     cursor.execute('''
+    CREATE TABLE IF NOT EXISTS web_accounts (
+        username TEXT PRIMARY KEY,
+        password_hash TEXT NOT NULL,
+        contact_info TEXT,
+        linked_user_id INTEGER,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        last_login_at TIMESTAMP,
+        FOREIGN KEY (linked_user_id) REFERENCES users (user_id)
+    )
+    ''')
+
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS invite_codes (
+        code TEXT PRIMARY KEY,
+        created_by_admin_id INTEGER,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        used_by_username TEXT,
+        used_by_user_id INTEGER,
+        used_at TIMESTAMP,
+        is_active BOOLEAN DEFAULT TRUE,
+        FOREIGN KEY (used_by_username) REFERENCES web_accounts (username),
+        FOREIGN KEY (used_by_user_id) REFERENCES users (user_id)
+    )
+    ''')
+
+    cursor.execute('''
     CREATE TABLE IF NOT EXISTS configs (
         config_id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
@@ -110,6 +136,136 @@ def get_or_create_user(user_id, username, first_name, last_name):
     conn.commit()
     conn.close()
     return user_id
+
+
+def get_web_account(username):
+    """Get a web login account by username"""
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    cursor.execute(
+        'SELECT username, password_hash, contact_info, linked_user_id, created_at, last_login_at FROM web_accounts WHERE username = ?',
+        (username,)
+    )
+    account = cursor.fetchone()
+    conn.close()
+    return account
+
+
+def save_web_account(username, password_hash, contact_info=None, linked_user_id=None):
+    """Create or update a web login account"""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    cursor.execute('''
+    INSERT INTO web_accounts (username, password_hash, contact_info, linked_user_id, last_login_at)
+    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+    ON CONFLICT(username) DO UPDATE SET
+        password_hash = excluded.password_hash,
+        contact_info = COALESCE(excluded.contact_info, web_accounts.contact_info),
+        linked_user_id = COALESCE(excluded.linked_user_id, web_accounts.linked_user_id),
+        last_login_at = CURRENT_TIMESTAMP
+    ''', (username, password_hash, contact_info, linked_user_id))
+
+    conn.commit()
+    conn.close()
+
+
+def update_web_account_login(username, contact_info=None, linked_user_id=None):
+    """Update last login metadata for a web account"""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    cursor.execute('''
+    UPDATE web_accounts
+    SET contact_info = COALESCE(?, contact_info),
+        linked_user_id = COALESCE(?, linked_user_id),
+        last_login_at = CURRENT_TIMESTAMP
+    WHERE username = ?
+    ''', (contact_info, linked_user_id, username))
+
+    conn.commit()
+    conn.close()
+
+
+def create_invite_code(code, created_by_admin_id):
+    """Create a one-time invite code"""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        '''
+        INSERT INTO invite_codes (code, created_by_admin_id)
+        VALUES (?, ?)
+        ''',
+        (code, created_by_admin_id),
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def get_invite_code(code):
+    """Fetch a single invite code record"""
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    cursor.execute(
+        '''
+        SELECT code, created_by_admin_id, created_at, used_by_username, used_by_user_id, used_at, is_active
+        FROM invite_codes
+        WHERE code = ?
+        ''',
+        (code,),
+    )
+    invite_code = cursor.fetchone()
+    conn.close()
+    return invite_code
+
+
+def list_invite_codes(limit=50):
+    """List recent invite codes for the admin panel"""
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    cursor.execute(
+        '''
+        SELECT code, created_by_admin_id, created_at, used_by_username, used_by_user_id, used_at, is_active
+        FROM invite_codes
+        ORDER BY created_at DESC
+        LIMIT ?
+        ''',
+        (limit,),
+    )
+    invite_codes = cursor.fetchall()
+    conn.close()
+    return invite_codes
+
+
+def consume_invite_code(code, username, linked_user_id):
+    """Mark an invite code as used exactly once"""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        '''
+        UPDATE invite_codes
+        SET used_by_username = ?,
+            used_by_user_id = ?,
+            used_at = CURRENT_TIMESTAMP,
+            is_active = FALSE
+        WHERE code = ? AND used_at IS NULL AND is_active = TRUE
+        ''',
+        (username, linked_user_id, code),
+    )
+
+    updated = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return updated > 0
 
 def save_new_config(user_id, email, client_id, total_gb):
     """Save a new VPN configuration"""

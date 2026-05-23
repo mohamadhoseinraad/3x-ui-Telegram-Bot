@@ -21,7 +21,7 @@ body {
 }
 
 .container {
-  width: min(1100px, 92%);
+  width: min(1100px, calc(100% - 1.25rem));
   margin: 0 auto;
 }
 
@@ -205,12 +205,88 @@ td {
 }
 
 @media (max-width: 720px) {
+  .container {
+    width: calc(100% - 0.9rem);
+  }
+
+  main {
+    padding: 0.85rem 0 1.3rem;
+  }
+
   .topbar-inner {
     flex-direction: column;
     align-items: flex-start;
   }
 
+  .topbar h1 {
+    margin: 0;
+    font-size: 1.25rem;
+  }
+
   .topbar nav {
     flex-wrap: wrap;
+    gap: 0.55rem 0.8rem;
+    width: 100%;
+    align-items: center;
+  }
+
+  .topbar nav a,
+  .lang-switch {
+    display: inline-flex;
+    align-items: center;
+  }
+
+  .card {
+    padding: 0.85rem;
+    border-radius: 10px;
+  }
+
+  .actions,
+  .inline-form {
+    width: 100%;
+  }
+
+  .actions {
+    flex-direction: column;
+  }
+
+  .inline-form {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  button,
+  .btn,
+  select,
+  input,
+  textarea {
+    width: 100%;
+  }
+
+  .table-wrap {
+    margin-right: -0.2rem;
+    margin-left: -0.2rem;
+  }
+
+  table {
+    min-width: 680px;
   }
 }
+
+/* RTL support when html[dir="rtl"] */
+html[dir="rtl"] {
+  direction: rtl;
+}
+
+html[dir="rtl"] .topbar-inner {
+  flex-direction: row-reverse;
+}
+
+html[dir="rtl"] nav a {
+  text-align: right;
+}
+
+html[dir="rtl"] .badge { margin-left: 0; margin-right: 0.55rem; }
+
+html[dir="rtl"] th, html[dir="rtl"] td { text-align: right; }
+

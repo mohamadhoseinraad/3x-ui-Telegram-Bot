@@ -11,6 +11,7 @@ from config import XUI_URL, XUI_USERNAME, XUI_PASSWORD, INBOUND_ID
 
 logger = logging.getLogger(__name__)
 session = requests.Session()
+session.trust_env = False
 _session_authenticated = False
 _last_login_time = 0
 # Session timeout in seconds (30 minutes)
@@ -35,7 +36,7 @@ def login_to_xui(force=False):
     url = f"{XUI_URL}/login"
     data = {"username": XUI_USERNAME, "password": XUI_PASSWORD}
     try:
-        response = session.post(url, json=data)
+        response = session.post(url, json=data, timeout=20)
         if response.ok:
             _session_authenticated = True
             _last_login_time = current_time

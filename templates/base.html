@@ -1,24 +1,28 @@
 <!doctype html>
-<html lang="en">
+<html lang="{{ lang }}" dir="{{ dir }}">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{ title or 'VPN Web App' }}</title>
+  <title>{{ title or t('site_title') }}</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
 </head>
 <body>
   <header class="topbar">
     <div class="container topbar-inner">
-      <h1>VPN Control Panel</h1>
+      <h1>{{ t('panel_title') }}</h1>
       {% if session.get('user_id') %}
       <nav>
-        <a href="{{ url_for('dashboard') }}">Dashboard</a>
-        <a href="{{ url_for('configs_view') }}">Configs</a>
-        <a href="{{ url_for('support') }}">Support</a>
+        <a href="{{ url_for('dashboard') }}">{{ t('dashboard') }}</a>
+        <a href="{{ url_for('configs_view') }}">{{ t('configs') }}</a>
+        <a href="{{ url_for('support') }}">{{ t('support') }}</a>
         {% if session.get('user_id') in ADMIN_IDS %}
-        <a href="{{ url_for('admin_dashboard') }}">Admin</a>
+        <a href="{{ url_for('admin_dashboard') }}">{{ t('admin') }}</a>
         {% endif %}
-        <a href="{{ url_for('logout') }}">Logout</a>
+        <a href="{{ url_for('logout') }}">{{ t('logout') }}</a>
+        <span class="lang-switch">
+          <a href="{{ url_for('set_lang', lang='en') }}">EN</a> |
+          <a href="{{ url_for('set_lang', lang='fa') }}">FA</a>
+        </span>
       </nav>
       {% endif %}
     </div>

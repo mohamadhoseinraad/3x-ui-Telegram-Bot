@@ -1,19 +1,19 @@
 {% extends 'base.html' %}
 {% block content %}
 <section class="card">
-  <h2>Support</h2>
+  <h2>{{ t('support') }}</h2>
   <form method="post" class="grid-form">
-    <label>New Ticket Subject
+    <label>{{ t('new_ticket_subject') }}
       <input type="text" name="subject" required>
     </label>
-    <button type="submit">Create Ticket</button>
+    <button type="submit">{{ t('create_ticket') }}</button>
   </form>
 </section>
 
 <section class="card">
-  <h3>My Tickets</h3>
+  <h3>{{ t('ticket_list') }}</h3>
   {% if not tickets %}
-    <p>You have no tickets yet.</p>
+    <p>{{ t('no_services') }}</p>
   {% else %}
     <ul class="list">
       {% for t in tickets %}

@@ -1,33 +1,33 @@
 {% extends 'base.html' %}
 {% block content %}
 <section class="hero card">
-  <h2>Welcome</h2>
-  <p>Manage VPN services, trial plans, payments, and support tickets from the web.</p>
+  <h2>{{ t('welcome') }}</h2>
+  <p>{{ t('manage_blurb') }}</p>
   <div class="actions">
-    <a class="btn" href="{{ url_for('buy_service') }}">Buy Service</a>
-    <a class="btn" href="{{ url_for('configs_view') }}">Check Status</a>
-    <a class="btn" href="{{ url_for('support') }}">Support</a>
+    <a class="btn" href="{{ url_for('buy_service') }}">{{ t('buy_service') }}</a>
+    <a class="btn" href="{{ url_for('configs_view') }}">{{ t('check_status') }}</a>
+    <a class="btn" href="{{ url_for('support') }}">{{ t('support') }}</a>
   </div>
 </section>
 
 <section class="card">
-  <h3>Free Trial</h3>
+  <h3>{{ t('free_trial_1') }}</h3>
   <form method="post" action="{{ url_for('free_trial') }}" class="inline-form">
     <input type="hidden" name="trial_size" value="1">
-    <button type="submit">Get 1GB / 1 day (one time)</button>
+    <button type="submit">{{ t('free_trial_1') }}</button>
   </form>
   <form method="post" action="{{ url_for('free_trial') }}" class="inline-form">
     <input type="hidden" name="trial_size" value="5">
-    <button type="submit">Get 5GB / 7 days (one time)</button>
+    <button type="submit">{{ t('free_trial_5') }}</button>
   </form>
 </section>
 
 <section class="card">
-  <h3>Buying Status</h3>
+  <h3>{{ t('buy_service') }}</h3>
   {% if allow_buy %}
-  <p class="ok">Sales are enabled.</p>
+  <p class="ok">{{ t('sales_enabled') }}</p>
   {% else %}
-  <p class="warn">Sales are currently disabled by admin.</p>
+  <p class="warn">{{ t('sales_disabled') }}</p>
   {% endif %}
 </section>
 {% endblock %}

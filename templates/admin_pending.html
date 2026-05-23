@@ -1,9 +1,9 @@
 {% extends 'base.html' %}
 {% block content %}
 <section class="card">
-  <h2>Pending Payments</h2>
+  <h2>{{ t('pending_payments') }}</h2>
   {% if not pending %}
-    <p>No pending payments.</p>
+    <p>{{ t('no_pending') }}</p>
   {% else %}
   <div class="table-wrap">
     <table>
@@ -12,8 +12,8 @@
           <th>ID</th>
           <th>User</th>
           <th>Plan</th>
-          <th>Receipt</th>
-          <th>Actions</th>
+          <th>{{ t('receipt_hint') }}</th>
+          <th>{{ t('approve') }}/{{ t('reject') }}</th>
         </tr>
       </thead>
       <tbody>

@@ -12,34 +12,43 @@ from datetime import timedelta
 from functools import wraps
 
 from flask import Flask, flash, redirect, render_template, request, session, url_for
+from flask import make_response
+from werkzeug.security import check_password_hash, generate_password_hash
 
 import config
 from config import ADMIN_IDS, DB_FILE, HOST, IPDOMAIN, PORT, SNI, payment_msg
 from database import (
     add_ticket_message,
+    consume_invite_code,
     check_trial_usage,
     close_ticket,
+    create_invite_code,
     create_ticket,
     get_all_configs_with_users,
     get_or_create_user,
+    get_invite_code,
+    get_web_account,
     get_payment_info,
     get_pending_payments,
     get_ticket_conversation,
     get_user_configs,
     get_user_tickets,
+    list_invite_codes,
     init_db,
     save_new_config,
+    save_web_account,
     save_payment_request,
     update_config_active_status,
     update_config_total_gb,
     update_payment_status,
     update_ticket_status,
+    update_web_account_login,
     verify_ticket_access,
 )
 from db_utils import delete_config_by_client_id, get_all_db_configs
 from menus import VPN_PLANS
 from xui_api import create_client, delete_client, extend_client, get_all_clients, get_client_status
-
+from translations import translate
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -49,7 +58,21 @@ app.secret_key = "replace-this-with-a-secure-secret"
 
 @app.context_processor
 def inject_globals():
-    return {"ADMIN_IDS": ADMIN_IDS}
+    lang = session.get("lang", "fa")
+    dir = "rtl" if lang == "fa" else "ltr"
+
+    def t(key, **kwargs):
+        return translate(key, lang, **kwargs)
+
+    return {"ADMIN_IDS": ADMIN_IDS, "t": t, "lang": lang, "dir": dir}
+
+
+@app.route('/set-lang/<lang>')
+def set_lang(lang):
+    if lang not in ('en', 'fa'):
+        return redirect(request.referrer or url_for('dashboard'))
+    session['lang'] = lang
+    return redirect(request.referrer or url_for('dashboard'))
 
 
 def random_suffix(length=6):
@@ -109,6 +132,54 @@ def _db_connection():
     return conn
 
 
+def _resolve_linked_user_id(username, reference_value=None):
+    candidates = []
+    if reference_value:
+        candidates.append(reference_value)
+    candidates.append(username)
+
+    conn = _db_connection()
+    try:
+        cursor = conn.cursor()
+        for candidate in candidates:
+            if isinstance(candidate, int):
+                cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (candidate,))
+            else:
+                cleaned_value = candidate.lstrip("@")
+                if cleaned_value.isdigit():
+                    cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (int(cleaned_value),))
+                else:
+                    cursor.execute(
+                        "SELECT user_id FROM users WHERE username = ? ORDER BY join_date DESC LIMIT 1",
+                        (cleaned_value,),
+                    )
+            row = cursor.fetchone()
+            if row:
+                return row["user_id"]
+    finally:
+        conn.close()
+
+    return None
+
+
+def _create_web_only_user(username):
+    conn = _db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT MIN(user_id) AS min_user_id FROM users WHERE user_id < 0")
+        row = cursor.fetchone()
+        next_user_id = -1 if row is None or row["min_user_id"] is None else row["min_user_id"] - 1
+
+        cursor.execute(
+            "INSERT INTO users (user_id, username, first_name, last_name) VALUES (?, ?, ?, ?)",
+            (next_user_id, username, username, None),
+        )
+        conn.commit()
+        return next_user_id
+    finally:
+        conn.close()
+
+
 @app.route("/")
 def home():
     if current_user_id() is None:
@@ -119,20 +190,55 @@ def home():
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
-        raw_user_id = request.form.get("user_id", "").strip()
         username = request.form.get("username", "").strip() or None
-        first_name = request.form.get("first_name", "").strip() or "WebUser"
-        last_name = request.form.get("last_name", "").strip() or None
+        password = request.form.get("password", "")
+        contact_info = request.form.get("contact_info", "").strip() or None
+        invite_code = request.form.get("invite_code", "").strip().upper() or None
 
-        if not raw_user_id.isdigit():
-            flash("User ID must be numeric.", "error")
+        if not username or not password:
+            flash("Username and password are required.", "error")
             return render_template("login.html")
 
-        user_id = int(raw_user_id)
-        get_or_create_user(user_id, username, first_name, last_name)
+        account = get_web_account(username)
+        linked_user_id = None
 
-        session["user_id"] = user_id
+        if account:
+            if not check_password_hash(account["password_hash"], password):
+                flash("Invalid username or password.", "error")
+                return render_template("login.html")
+
+            linked_user_id = account["linked_user_id"]
+            if linked_user_id is None:
+                linked_user_id = _resolve_linked_user_id(username, contact_info)
+                if linked_user_id is None:
+                    flash("This account is not linked yet. Add your Telegram ID or Telegram username once to finish setup.", "error")
+                    return render_template("login.html")
+
+            update_web_account_login(username, contact_info, linked_user_id)
+        else:
+            if not invite_code:
+                flash("Invite code is required to create a new account.", "error")
+                return render_template("login.html")
+
+            invite_record = get_invite_code(invite_code)
+            if not invite_record or not invite_record["is_active"] or invite_record["used_at"]:
+                flash("Invalid or already used invite code.", "error")
+                return render_template("login.html")
+
+            linked_user_id = _resolve_linked_user_id(username, contact_info)
+            if linked_user_id is None:
+                linked_user_id = _create_web_only_user(username)
+
+            password_hash = generate_password_hash(password)
+            save_web_account(username, password_hash, contact_info, linked_user_id)
+
+            if not consume_invite_code(invite_code, username, linked_user_id):
+                flash("Invite code could not be consumed. Please try again.", "error")
+                return render_template("login.html")
+
+        session["user_id"] = linked_user_id
         session["username"] = username
+        session["web_username"] = username
         flash("Signed in successfully.", "success")
         return redirect(url_for("dashboard"))
 
@@ -367,7 +473,30 @@ def ticket_detail(ticket_id):
 @login_required
 @admin_required
 def admin_dashboard():
-    return render_template("admin_dashboard.html")
+    invite_codes = list_invite_codes()
+    return render_template("admin_dashboard.html", invite_codes=invite_codes)
+
+
+@app.route("/admin/invite-codes/create", methods=["POST"])
+@login_required
+@admin_required
+def admin_create_invite_code():
+    code_length_raw = request.form.get("code_length", "10").strip()
+    if not code_length_raw.isdigit():
+        flash("Invalid invite code length.", "error")
+        return redirect(url_for("admin_dashboard"))
+
+    code_length = max(6, min(int(code_length_raw), 32))
+    alphabet = string.ascii_uppercase + string.digits
+    code = "".join(random.choices(alphabet, k=code_length))
+
+    try:
+        create_invite_code(code, current_user_id())
+        flash(f"Invite code created: {code}", "success")
+    except sqlite3.IntegrityError:
+        flash("Generated a duplicate invite code. Try again.", "error")
+
+    return redirect(url_for("admin_dashboard"))
 
 
 @app.route("/admin/pending")
