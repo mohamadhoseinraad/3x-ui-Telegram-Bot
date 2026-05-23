@@ -1,0 +1,29 @@
+services:
+  web:
+    build:
+      context: .
+    command: python app.py
+    env_file:
+      - .env
+    environment:
+      DB_FILE: /data/xui_bot_.db
+    ports:
+      - "5500:5500"
+    volumes:
+      - bot_data:/data
+    restart: unless-stopped
+
+  bot:
+    build:
+      context: .
+    command: python bot.py
+    env_file:
+      - .env
+    environment:
+      DB_FILE: /data/xui_bot_.db
+    volumes:
+      - bot_data:/data
+    restart: unless-stopped
+
+volumes:
+  bot_data:
