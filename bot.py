@@ -258,9 +258,13 @@ async def handle_show_status(query, email, user_id):
 
 async def handle_buy_service(query, user_id):
     """Handle the buy service option"""
-    keyboard = get_vpn_plans_keyboard() + get_back_to_main_button()
+    policy = get_service_policy()
+    keyboard = get_vpn_plans_keyboard(policy) + get_back_to_main_button()
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.edit_message_text("لطفاً پلن مورد نظر خود را انتخاب کنید.", reply_markup=reply_markup)
+    max_config_gb = policy.get("max_config_gb", 0)
+    max_config_label = "نامحدود" if not max_config_gb else f"{int(max_config_gb) if float(max_config_gb).is_integer() else max_config_gb}GB"
+
+    await query.edit_message_text(f"لطفاً پلن مورد نظر خود را انتخاب کنید.\n هر کانفیگ حداکثر به مقدار {max_config_label} قابل شارژ است", reply_markup=reply_markup)
 
 async def handle_buy_service_gift(query, user_id):
     """Handle the buy gift service option"""

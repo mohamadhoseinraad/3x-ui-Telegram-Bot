@@ -50,7 +50,7 @@ from database import (
     verify_ticket_access,
 )
 from db_utils import delete_config_by_client_id, get_all_db_configs
-from menus import VPN_PLANS
+from menus import VPN_PLANS, build_vpn_plans
 from xui_api import create_client, delete_client, extend_client, get_all_clients, get_client_status
 from translations import translate
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -435,7 +435,7 @@ def buy_service():
 
     return render_template(
         "buy.html",
-        plans=VPN_PLANS,
+        plans=build_vpn_plans(get_service_policy()),
         allow_buy=config.ALLOW_BUY,
         payment_msg=payment_msg,
     )

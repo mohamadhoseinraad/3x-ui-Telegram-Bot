@@ -1,15 +1,44 @@
 """
 Menu structures and keyboard layouts for the Telegram bot
 """
+import math
+import time
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 # VPN plans
 VPN_PLANS = {
-    "gb_1": {"name": "1 Gb  تا زمان ", "gb": 1},
-    "gb_2": {"name": "2 Gb  تا زمان ", "gb": 2},
-    "gb_5": {"name": "5 Gb  تا زمان ", "gb": 5},
-    "gb_10": {"name": "10 Gb  تا زمان ", "gb": 10},
+    "gb_1": {"name": "(1 Gb)", "gb": 1},
+    "gb_2": {"name": "(2 Gb)", "gb": 2},
+    "gb_5": {"name": "(5 Gb)", "gb": 5},
+    "gb_10": {"name": "(10 Gb)", "gb": 10},
 }
+
+
+def get_days_until_expiry(expiry_time_ms):
+    if not expiry_time_ms:
+        return None
+
+    remaining_ms = int(expiry_time_ms) - int(time.time() * 1000)
+    if remaining_ms <= 0:
+        return 0
+
+    return max(1, math.ceil(remaining_ms / 86400000))
+
+
+def build_vpn_plans(policy=None):
+    plans = {}
+    days_until_expiry = get_days_until_expiry((policy or {}).get("global_expiry_time_ms"))
+
+    for plan_key, plan in VPN_PLANS.items():
+        plan_name = plan["name"]
+        if days_until_expiry is not None:
+            plan_name = f"{plan_name} | {days_until_expiry}  روزه"
+            # plan_name = f"{days_until_expiry}  روزه"
+
+        plans[plan_key] = {**plan, "name": plan_name}
+
+    return plans
 
 # Free trial plans
 def get_free_trial_keyboard():
@@ -19,19 +48,21 @@ def get_free_trial_keyboard():
     ]
 
 # Regular VPN plans keyboard
-def get_vpn_plans_keyboard():
+def get_vpn_plans_keyboard(policy=None):
+    plans = build_vpn_plans(policy)
     return [
-        [InlineKeyboardButton("1 Gb  تا زمان  انتقضا()", callback_data="gb_1")],
-        [InlineKeyboardButton("2 Gb  تا زمان  انتقضا()", callback_data="gb_2")],
-        [InlineKeyboardButton("5 Gb  تا زمان  انتقضا()", callback_data="gb_5")],
-        [InlineKeyboardButton("10 Gb  تا زمان  انتقضا()", callback_data="gb_10")]
+        [InlineKeyboardButton(plans["gb_1"]["name"], callback_data="gb_1")],
+        [InlineKeyboardButton(plans["gb_2"]["name"], callback_data="gb_2")],
+        [InlineKeyboardButton(plans["gb_5"]["name"], callback_data="gb_5")],
+        [InlineKeyboardButton(plans["gb_10"]["name"], callback_data="gb_10")]
     ]
-def get_vpn_extend_plans_keyboard(email):
+def get_vpn_extend_plans_keyboard(email, policy=None):
+    plans = build_vpn_plans(policy)
     keyboard = [
-        [InlineKeyboardButton("➕1 Gb  تا زمان  انتقضا(بدون تمدید زمانی)", callback_data="extend_gb_1")],
-        [InlineKeyboardButton("➕2 Gb  تا زمان  انتقضا(بدون تمدید زمانی)", callback_data="extend_gb_2")],
-        [InlineKeyboardButton("➕5 Gb  تا زمان  انتقضا(بدون تمدید زمانی)", callback_data="extend_gb_5")],
-        [InlineKeyboardButton("➕10 Gb  تا زمان  انتقضا(بدون تمدید زمانی)", callback_data="extend_gb_10")],
+        [InlineKeyboardButton(f"➕{plans['gb_1']['name']} (بدون تمدید زمانی)", callback_data="extend_gb_1")],
+        [InlineKeyboardButton(f"➕{plans['gb_2']['name']} (بدون تمدید زمانی)", callback_data="extend_gb_2")],
+        [InlineKeyboardButton(f"➕{plans['gb_5']['name']} (بدون تمدید زمانی)", callback_data="extend_gb_5")],
+        [InlineKeyboardButton(f"➕{plans['gb_10']['name']} (بدون تمدید زمانی)", callback_data="extend_gb_10")],
         [InlineKeyboardButton("🔙 بازگشت", callback_data=f"status_{email}")]
     ]
     return keyboard
@@ -100,15 +131,15 @@ def get_admin_menu_keyboard():
         [InlineKeyboardButton("🎫 تیکت‌های پشتیبانی", callback_data="admin_tickets")],
         [InlineKeyboardButton("👨‍💻 مدیریت کلاینت ها", callback_data="admin_manage_clients")],
         [InlineKeyboardButton("📢 ارسال پیام به همه", callback_data="admin_broadcast")],
-        [InlineKeyboardButton("⏱️ تمدید همه کلاینت ها", callback_data="admin_extend_all")],
+        [InlineKeyboardButton("⏱️ تنظیم تاریخ انقضای همه کلاینت‌ها", callback_data="admin_extend_all")],
         [InlineKeyboardButton("فعال/غیر فعال سازی فروش", callback_data="admin_buy_allow")]
     ])
 
 def get_extend_all_client_day():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("1 روز", callback_data="admin_extend_all_1")],
-        [InlineKeyboardButton("3 روز", callback_data="admin_extend_all_3")],
-        [InlineKeyboardButton("10 روز", callback_data="admin_extend_all_10")],
+        [InlineKeyboardButton("1 روز افزایش تاریخ انقضا", callback_data="admin_extend_all_1")],
+        [InlineKeyboardButton("3 روز افزایش تاریخ انقضا", callback_data="admin_extend_all_3")],
+        [InlineKeyboardButton("10 روز افزایش تاریخ انقضا", callback_data="admin_extend_all_10")],
         [InlineKeyboardButton("برگشت", callback_data="admin_menu")]
     ])
 def get_buy_allow_keyboard():
