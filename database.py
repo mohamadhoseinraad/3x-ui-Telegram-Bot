@@ -129,8 +129,12 @@ def get_or_create_user(user_id, username, first_name, last_name):
     cursor = conn.cursor()
 
     cursor.execute('''
-    INSERT OR IGNORE INTO users (user_id, username, first_name, last_name)
+    INSERT INTO users (user_id, username, first_name, last_name)
     VALUES (?, ?, ?, ?)
+    ON CONFLICT(user_id) DO UPDATE SET
+        username = COALESCE(excluded.username, users.username),
+        first_name = COALESCE(excluded.first_name, users.first_name),
+        last_name = COALESCE(excluded.last_name, users.last_name)
     ''', (user_id, username, first_name, last_name))
 
     conn.commit()
@@ -151,6 +155,18 @@ def get_web_account(username):
     account = cursor.fetchone()
     conn.close()
     return account
+
+
+def has_web_accounts():
+    """Return True when at least one web account exists."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    cursor.execute('SELECT 1 FROM web_accounts LIMIT 1')
+    exists = cursor.fetchone() is not None
+
+    conn.close()
+    return exists
 
 
 def save_web_account(username, password_hash, contact_info=None, linked_user_id=None):
@@ -187,6 +203,110 @@ def update_web_account_login(username, contact_info=None, linked_user_id=None):
 
     conn.commit()
     conn.close()
+
+
+def link_web_account_to_telegram_id(username, telegram_user_id, first_name=None, last_name=None):
+    """Link a web account to a Telegram user id and migrate any existing user-owned rows."""
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    cursor.execute(
+        'SELECT linked_user_id FROM web_accounts WHERE username = ?',
+        (username,)
+    )
+    account = cursor.fetchone()
+    if not account:
+        conn.close()
+        return False, 'Web account not found'
+
+    current_user_id = account['linked_user_id']
+    if current_user_id is not None and current_user_id > 0 and current_user_id != telegram_user_id:
+        conn.close()
+        return False, 'This web account is already linked to another Telegram user id.'
+
+    def update_foreign_keys(source_user_id, target_user_id):
+        cursor.execute('UPDATE configs SET user_id = ? WHERE user_id = ?', (target_user_id, source_user_id))
+        cursor.execute('UPDATE payments SET user_id = ? WHERE user_id = ?', (target_user_id, source_user_id))
+        cursor.execute('UPDATE tickets SET user_id = ? WHERE user_id = ?', (target_user_id, source_user_id))
+        cursor.execute('UPDATE ticket_messages SET sender_id = ? WHERE sender_id = ?', (target_user_id, source_user_id))
+        cursor.execute('UPDATE invite_codes SET used_by_user_id = ? WHERE used_by_user_id = ?', (target_user_id, source_user_id))
+
+    try:
+        conn.execute('BEGIN')
+
+        cursor.execute('SELECT user_id, username, first_name, last_name FROM users WHERE user_id = ?', (telegram_user_id,))
+        target_user = cursor.fetchone()
+        cursor.execute('SELECT user_id, username, first_name, last_name FROM users WHERE user_id = ?', (current_user_id,))
+        source_user = cursor.fetchone() if current_user_id is not None else None
+
+        fallback_username = username
+        fallback_first_name = first_name or username
+
+        if current_user_id == telegram_user_id:
+            if target_user is None:
+                cursor.execute(
+                    'INSERT INTO users (user_id, username, first_name, last_name) VALUES (?, ?, ?, ?)',
+                    (telegram_user_id, fallback_username, fallback_first_name, last_name)
+                )
+        elif current_user_id is None:
+            if target_user is None:
+                cursor.execute(
+                    'INSERT INTO users (user_id, username, first_name, last_name) VALUES (?, ?, ?, ?)',
+                    (telegram_user_id, fallback_username, fallback_first_name, last_name)
+                )
+            else:
+                cursor.execute(
+                    '''
+                    UPDATE users
+                    SET username = COALESCE(?, username),
+                        first_name = COALESCE(?, first_name),
+                        last_name = COALESCE(?, last_name)
+                    WHERE user_id = ?
+                    ''',
+                    (fallback_username, fallback_first_name, last_name, telegram_user_id),
+                )
+        else:
+            if target_user is None:
+                if source_user is not None:
+                    update_foreign_keys(current_user_id, telegram_user_id)
+                    cursor.execute(
+                        'UPDATE users SET user_id = ?, username = COALESCE(?, username), first_name = COALESCE(?, first_name), last_name = COALESCE(?, last_name) WHERE user_id = ?',
+                        (telegram_user_id, fallback_username, fallback_first_name, last_name, current_user_id)
+                    )
+                else:
+                    cursor.execute(
+                        'INSERT INTO users (user_id, username, first_name, last_name) VALUES (?, ?, ?, ?)',
+                        (telegram_user_id, fallback_username, fallback_first_name, last_name)
+                    )
+            else:
+                if source_user is not None:
+                    update_foreign_keys(current_user_id, telegram_user_id)
+                    cursor.execute('DELETE FROM users WHERE user_id = ?', (current_user_id,))
+                cursor.execute(
+                    '''
+                    UPDATE users
+                    SET username = COALESCE(?, username),
+                        first_name = COALESCE(?, first_name),
+                        last_name = COALESCE(?, last_name)
+                    WHERE user_id = ?
+                    ''',
+                    (fallback_username, fallback_first_name, last_name, telegram_user_id),
+                )
+
+        cursor.execute(
+            'UPDATE web_accounts SET linked_user_id = ?, contact_info = COALESCE(contact_info, ?) WHERE username = ?',
+            (telegram_user_id, str(telegram_user_id), username)
+        )
+
+        conn.commit()
+        return True, telegram_user_id
+    except Exception:
+        conn.rollback()
+        logger.exception('Failed to link web account %s to Telegram id %s', username, telegram_user_id)
+        return False, 'Unable to link Telegram user id'
+    finally:
+        conn.close()
 
 
 def create_invite_code(code, created_by_admin_id):

@@ -30,4 +30,20 @@
   <p class="warn">{{ t('sales_disabled') }}</p>
   {% endif %}
 </section>
+
+<section class="card">
+  <h3>{{ t('telegram_link_title') }}</h3>
+  <p class="hint">{{ t('telegram_link_note') }}</p>
+  <p>
+    {{ t('current_telegram_user_id') }}:
+    <strong>{{ web_account.linked_user_id if web_account and web_account.linked_user_id else t('not_linked_telegram_user_id') }}</strong>
+  </p>
+  <form method="post" action="{{ url_for('update_telegram_user_id') }}" class="grid-form narrow-form">
+    <label>{{ t('telegram_user_id_label') }}
+      <input type="number" name="telegram_user_id" inputmode="numeric" min="1" value="{{ web_account.linked_user_id if web_account and web_account.linked_user_id else '' }}" placeholder="{{ t('telegram_user_id_placeholder') }}" required>
+    </label>
+    <p class="hint">{{ t('telegram_user_id_hint') }}</p>
+    <button type="submit">{{ t('save_telegram_user_id') }}</button>
+  </form>
+</section>
 {% endblock %}

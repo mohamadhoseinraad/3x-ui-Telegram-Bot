@@ -33,11 +33,13 @@ from database import (
     get_ticket_conversation,
     get_user_configs,
     get_user_tickets,
+    has_web_accounts,
     list_invite_codes,
     init_db,
     save_new_config,
     save_web_account,
     save_payment_request,
+    link_web_account_to_telegram_id,
     update_config_active_status,
     update_config_total_gb,
     update_payment_status,
@@ -211,19 +213,21 @@ def login():
             if linked_user_id is None:
                 linked_user_id = _resolve_linked_user_id(username, contact_info)
                 if linked_user_id is None:
-                    flash("This account is not linked yet. Add your Telegram ID or Telegram username once to finish setup.", "error")
-                    return render_template("login.html")
+                    linked_user_id = _create_web_only_user(username)
 
             update_web_account_login(username, contact_info, linked_user_id)
         else:
-            if not invite_code:
+            bootstrap_mode = not has_web_accounts()
+
+            if not invite_code and not bootstrap_mode:
                 flash("Invite code is required to create a new account.", "error")
                 return render_template("login.html")
 
-            invite_record = get_invite_code(invite_code)
-            if not invite_record or not invite_record["is_active"] or invite_record["used_at"]:
-                flash("Invalid or already used invite code.", "error")
-                return render_template("login.html")
+            if not bootstrap_mode:
+                invite_record = get_invite_code(invite_code)
+                if not invite_record or not invite_record["is_active"] or invite_record["used_at"]:
+                    flash("Invalid or already used invite code.", "error")
+                    return render_template("login.html")
 
             linked_user_id = _resolve_linked_user_id(username, contact_info)
             if linked_user_id is None:
@@ -232,9 +236,10 @@ def login():
             password_hash = generate_password_hash(password)
             save_web_account(username, password_hash, contact_info, linked_user_id)
 
-            if not consume_invite_code(invite_code, username, linked_user_id):
-                flash("Invite code could not be consumed. Please try again.", "error")
-                return render_template("login.html")
+            if not bootstrap_mode:
+                if not consume_invite_code(invite_code, username, linked_user_id):
+                    flash("Invite code could not be consumed. Please try again.", "error")
+                    return render_template("login.html")
 
         session["user_id"] = linked_user_id
         session["username"] = username
@@ -255,11 +260,39 @@ def logout():
 @app.route("/dashboard")
 @login_required
 def dashboard():
+    web_account = get_web_account(session.get("web_username") or session.get("username") or "")
     return render_template(
         "dashboard.html",
         is_admin_user=is_admin(),
         allow_buy=config.ALLOW_BUY,
+        web_account=web_account,
+        telegram_user_id=current_user_id(),
     )
+
+
+@app.route("/account/telegram-id", methods=["POST"])
+@login_required
+def update_telegram_user_id():
+    web_username = session.get("web_username") or session.get("username")
+    telegram_user_id_raw = request.form.get("telegram_user_id", "").strip()
+
+    if not web_username:
+        flash("Unable to resolve the current web account.", "error")
+        return redirect(url_for("dashboard"))
+
+    if not telegram_user_id_raw.isdigit():
+        flash("Telegram user id must be a numeric value.", "error")
+        return redirect(url_for("dashboard"))
+
+    telegram_user_id = int(telegram_user_id_raw)
+    success, result = link_web_account_to_telegram_id(web_username, telegram_user_id)
+    if not success:
+        flash(result, "error")
+        return redirect(url_for("dashboard"))
+
+    session["user_id"] = telegram_user_id
+    flash("Telegram user id linked successfully.", "success")
+    return redirect(url_for("dashboard"))
 
 
 @app.route("/configs")
@@ -734,4 +767,4 @@ def admin_toggle_buy():
 
 if __name__ == "__main__":
     init_db()
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=5500, debug=True)
