@@ -30,7 +30,8 @@ from database import (
     save_payment_request, get_all_users,
     create_ticket, add_ticket_message, close_ticket, update_ticket_status, verify_ticket_access,
     get_formatted_user_tickets, get_ticket_conversation, get_payment_info, update_payment_status,
-    get_pending_payments, update_config_total_gb, get_all_configs_with_users
+    get_pending_payments, update_config_total_gb, get_all_configs_with_users,
+    get_service_policy
 )
 from menus import (
     VPN_PLANS, get_main_menu_keyboard, get_free_trial_keyboard, get_vpn_plans_keyboard,
@@ -57,6 +58,35 @@ def generate_vless_link(client_id, email):
         f"?type=ws&path=%2F&host={HOST}&security=tls&fp=firefox&alpn=h3%2Ch2%2Chttp%2F1.1&sni={SNI}"
         f"#{email}"
     )
+
+
+def _parse_plan_gb(plan_name):
+    """Extract the plan size in GB from a plan name."""
+    import re
+
+    if plan_name is None:
+        return 0.0
+
+    if isinstance(plan_name, (int, float)):
+        return float(plan_name)
+
+    text = str(plan_name)
+    if not text:
+        return 0.0
+
+    persian_digits = str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")
+    arabic_digits = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+    text = text.translate(persian_digits).translate(arabic_digits)
+
+    match = re.search(r'(\d+(?:[.,]\d+)?)\s*(?:گیگابایت|گیگاب|گیگ|GB|G)\b', text, re.IGNORECASE)
+    if match:
+        return float(match.group(1).replace(',', '.'))
+
+    match = re.search(r'(\d+(?:[.,]\d+)?)', text)
+    if match:
+        return float(match.group(1).replace(',', '.'))
+
+    return 0.0
 
 # Command handlers
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -258,6 +288,15 @@ async def handle_plan_selection(query, plan_data, user_id, context: ContextTypes
         await query.edit_message_text("پلن نامعتبر است.", reply_markup=reply_markup)
         return
 
+    policy = get_service_policy()
+    if policy['max_config_gb'] > 0 and float(plan.get('gb', 0)) > policy['max_config_gb']:
+        reply_markup = InlineKeyboardMarkup(get_back_to_main_button())
+        await query.edit_message_text(
+            f"❗ حجم این پلن از محدودیت {policy['max_config_gb']}GB بیشتر است.",
+            reply_markup=reply_markup,
+        )
+        return
+
     context.user_data['selected_plan'] = plan
     keyboard = get_back_to_main_button()
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -303,12 +342,17 @@ async def handle_free_trial(query, data, user_id, context: ContextTypes.DEFAULT_
         email = f"u{user_id}_{suffix}@free_{gb_amount}_gb"
 
     total_bytes = gb_amount * 1024 ** 3
+    policy = get_service_policy()
+
+    if policy['max_config_gb'] > 0 and gb_amount > policy['max_config_gb']:
+        await query.edit_message_text(
+            f"❗ حجم این هدیه از محدودیت {policy['max_config_gb']}GB بیشتر است.",
+            reply_markup=reply_markup
+        )
+        return
 
     # Set expiry time based on trial type
-    if data == "free_1gb":
-        expiry_time = int(time.time() + 1 * 86400) * 1000  # 1 day
-    else:  # free_2gb
-        expiry_time = int(time.time() + 7 * 86400) * 1000  # 1 day
+    expiry_time = policy['global_expiry_time_ms']
 
     try:
         client_id, error = create_client(email, total_bytes, expiry_time)
@@ -350,7 +394,7 @@ async def handle_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     extension_email = plan.get('email', None) if is_extension else None
 
     # Save payment request
-    payment_id = save_payment_request(user_id, plan['gb'], photo.file_id)
+    payment_id = save_payment_request(user_id, plan['name'], photo.file_id)
 
     # Notify admins
     for admin_id in ADMIN_IDS:
@@ -1003,7 +1047,8 @@ async def approve_payment(query, payment_id, context: ContextTypes.DEFAULT_TYPE)
         return
 
     user_id, plan_name, username = payment_info
-    plan_gb = int(plan_name.split()[0])  # Extract GB amount from plan name
+    plan_gb = _parse_plan_gb(plan_name)
+    policy = get_service_policy()
 
     # Check if this is an extension request
     is_extension = False
@@ -1033,8 +1078,11 @@ async def approve_payment(query, payment_id, context: ContextTypes.DEFAULT_TYPE)
             if not status:
                 raise Exception("خطا در دریافت اطلاعات سرویس فعلی")
 
+            if policy['max_config_gb'] > 0 and status['total_gb'] + plan_gb > policy['max_config_gb']:
+                raise Exception(f"تمدید از محدودیت {policy['max_config_gb']} گیگابایت بیشتر می‌شود")
+
             # Extend the client service
-            success, error_msg = extend_client(extension_email, extension_client_id, plan_gb, timedelta(days=30))
+            success, error_msg = extend_client(extension_email, extension_client_id, plan_gb, policy['global_expiry_time_ms'])
 
             if not success:
                 raise Exception(f"خطا در تمدید سرویس: {error_msg}")
@@ -1055,7 +1103,7 @@ async def approve_payment(query, payment_id, context: ContextTypes.DEFAULT_TYPE)
                 chat_id=user_id,
                 text=f"✅ درخواست تمدید شما تأیید شد!\n\n"
                      f"حجم {plan_gb} گیگابایت به سرویس شما اضافه شد\n"
-                     f"تاریخ انقضا ۳۰ روز تمدید شد\n\n"
+                     f"تاریخ انقضا به تاریخ سراسری تنظیم شد\n\n"
                      f"🔗 لینک کانفیگ شما:\n`{vless_link}`",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(get_back_to_main_button())
@@ -1071,6 +1119,9 @@ async def approve_payment(query, payment_id, context: ContextTypes.DEFAULT_TYPE)
             )
         else:
             # Handle new service creation (existing logic)
+            if policy['max_config_gb'] > 0 and plan_gb > policy['max_config_gb']:
+                raise Exception(f"پلن از محدودیت {policy['max_config_gb']} گیگابایت بیشتر است")
+
             # Create unique identifiers for the new client
             client_id = str(uuid.uuid4())
             suffix = random_suffix()
@@ -1084,8 +1135,8 @@ async def approve_payment(query, payment_id, context: ContextTypes.DEFAULT_TYPE)
                 email = f"u{user_id}_{suffix}@vpn"
 
             # Calculate configuration details
-            total_bytes = plan_gb * 1024 ** 3  # Convert GB to bytes
-            expiry_time = int(time.time() + 30 * 86400) * 1000  # 30 days in milliseconds
+            total_bytes = int(round(plan_gb * (1024 ** 3)))  # Convert GB to bytes
+            expiry_time = policy['global_expiry_time_ms']
 
             # Create the client on the VPN server
             client_id, error = create_client(email, total_bytes, expiry_time)
@@ -1114,7 +1165,7 @@ async def approve_payment(query, payment_id, context: ContextTypes.DEFAULT_TYPE)
             # Confirm successful approval to admin
             await context.bot.send_message(
                 chat_id=query.message.chat_id,
-                text=f"پرداخت {payment_id} تأیید شد و کانفیگ برای کارب�� ارسال شد."
+                text=f"پرداخت {payment_id} تأیید شد و کانفیگ برای کاربر ارسال شد."
             )
 
     except Exception as e:
@@ -1122,7 +1173,8 @@ async def approve_payment(query, payment_id, context: ContextTypes.DEFAULT_TYPE)
         # Notify admin about the error
         await context.bot.send_message(
             chat_id=query.message.chat_id,
-            text=f"خطا در پردازش پرداخت: {str(e)}", reply_markup=InlineKeyboardMarkup(get_admin_menu_keyboard())
+            text=f"خطا در پردازش پرداخت: {str(e)}",
+            reply_markup=get_admin_menu_keyboard(),
         )
 
 async def reject_payment(query, payment_id, context: ContextTypes.DEFAULT_TYPE):
@@ -1193,7 +1245,7 @@ async def reject_payment(query, payment_id, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(
                 chat_id=query.message.chat_id,
                 text=f"پرداخت {payment_id} رد شد اما اعلان به کاربر با خطا مواجه شد: {str(e)}"
-                ,reply_markup=InlineKeyboardMarkup(get_admin_menu_keyboard())
+                ,reply_markup=get_admin_menu_keyboard()
             )
 
     except Exception as e:
@@ -1202,7 +1254,8 @@ async def reject_payment(query, payment_id, context: ContextTypes.DEFAULT_TYPE):
         # Notify admin about the error
         await context.bot.send_message(
             chat_id=query.message.chat_id,
-            text=f"خطا در رد پرداخت {payment_id}: {str(e)}", reply_markup=InlineKeyboardMarkup(get_admin_menu_keyboard())
+            text=f"خطا در رد پرداخت {payment_id}: {str(e)}",
+            reply_markup=get_admin_menu_keyboard(),
         )
 async def handle_view_receipt(query, data, user_id, context: ContextTypes.DEFAULT_TYPE):
     """Handle the view receipt button click to show the receipt image to admin"""
@@ -1244,7 +1297,7 @@ async def handle_view_receipt(query, data, user_id, context: ContextTypes.DEFAUL
 
     except Exception as e:
         logger.error(f"Error viewing receipt: {e}")
-        await query.answer("خطا در نمایش رسید!", reply_markup=InlineKeyboardMarkup(get_admin_menu_keyboard()))
+        await query.answer("خطا در نمایش رسید!")
 
 async def refresh_config_status(query, context: ContextTypes.DEFAULT_TYPE):
     """Refresh the status of the current config"""
@@ -1294,6 +1347,23 @@ async def handle_extend_selection(query, data, user_id, context: ContextTypes.DE
     """Handle the selection of an extension amount"""
     # Extract GB amount from callback data
     gb_amount = int(data.split('_')[2])
+    policy = get_service_policy()
+
+    if policy['max_config_gb'] > 0:
+        current_total_gb = None
+
+        for config in get_user_configs(user_id):
+            if config[1] == context.user_data.get('extending_email'):
+                current_total_gb = float(config[3])
+                break
+
+        if current_total_gb is not None and current_total_gb + gb_amount > policy['max_config_gb']:
+            reply_markup = InlineKeyboardMarkup(get_back_to_main_button())
+            await query.edit_message_text(
+                f"❗ این تمدید از محدودیت {policy['max_config_gb']}GB بیشتر می‌شود.",
+                reply_markup=reply_markup,
+            )
+            return
 
     # Check if we have the email in context
     if 'extending_email' not in context.user_data:

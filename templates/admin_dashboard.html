@@ -11,6 +11,22 @@
 </section>
 
 <section class="card">
+  <h3>Service Policy</h3>
+  <form method="post" action="{{ url_for('admin_update_settings') }}" class="grid-form narrow-form">
+    <label>
+      Max GB per config
+      <input type="number" name="max_config_gb" min="0" step="0.1" value="{{ policy.max_config_gb }}" placeholder="0 for unlimited">
+    </label>
+    <label>
+      Global expiry date
+      <input type="date" name="global_expiry_date" value="{{ policy.global_expiry_date }}" required>
+    </label>
+    <p class="hint">All new configs and approved extensions use this expiry date.</p>
+    <button type="submit">Save Policy</button>
+  </form>
+</section>
+
+<section class="card">
   <h3>Invite Codes</h3>
   <form method="post" action="{{ url_for('admin_create_invite_code') }}" class="inline-form">
     <label>

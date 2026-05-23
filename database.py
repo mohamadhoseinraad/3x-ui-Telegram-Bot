@@ -3,7 +3,7 @@ Database operations for the VPN bot
 """
 import sqlite3
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from config import DB_FILE
 
 logger = logging.getLogger(__name__)
@@ -61,6 +61,23 @@ def init_db():
         FOREIGN KEY (user_id) REFERENCES users (user_id)
     )
     ''')
+
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS app_settings (
+        setting_key TEXT PRIMARY KEY,
+        setting_value TEXT NOT NULL
+    )
+    ''')
+
+    default_expiry_date = (datetime.now() + timedelta(days=30)).strftime('%Y-%m-%d')
+    cursor.execute(
+        'INSERT OR IGNORE INTO app_settings (setting_key, setting_value) VALUES (?, ?)',
+        ('max_config_gb', '0')
+    )
+    cursor.execute(
+        'INSERT OR IGNORE INTO app_settings (setting_key, setting_value) VALUES (?, ?)',
+        ('global_expiry_date', default_expiry_date)
+    )
 
     # Check if last_notified column exists in configs table
     cursor.execute("PRAGMA table_info(configs)")
@@ -155,6 +172,69 @@ def get_web_account(username):
     account = cursor.fetchone()
     conn.close()
     return account
+
+
+def get_app_settings():
+    """Get application-wide service policy settings."""
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    cursor.execute('SELECT setting_key, setting_value FROM app_settings')
+    settings = {row['setting_key']: row['setting_value'] for row in cursor.fetchall()}
+    conn.close()
+
+    default_expiry_date = (datetime.now() + timedelta(days=30)).strftime('%Y-%m-%d')
+    return {
+        'max_config_gb': settings.get('max_config_gb', '0') or '0',
+        'global_expiry_date': settings.get('global_expiry_date', default_expiry_date) or default_expiry_date,
+    }
+
+
+def update_app_settings(max_config_gb=None, global_expiry_date=None):
+    """Update application-wide service policy settings."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    if max_config_gb is not None:
+        cursor.execute(
+            '''
+            INSERT INTO app_settings (setting_key, setting_value)
+            VALUES ('max_config_gb', ?)
+            ON CONFLICT(setting_key) DO UPDATE SET setting_value = excluded.setting_value
+            ''',
+            (str(max_config_gb),)
+        )
+
+    if global_expiry_date is not None:
+        cursor.execute(
+            '''
+            INSERT INTO app_settings (setting_key, setting_value)
+            VALUES ('global_expiry_date', ?)
+            ON CONFLICT(setting_key) DO UPDATE SET setting_value = excluded.setting_value
+            ''',
+            (global_expiry_date,)
+        )
+
+    conn.commit()
+    conn.close()
+
+
+def get_service_policy():
+    """Return parsed service policy values used by web and bot flows."""
+    settings = get_app_settings()
+    max_config_gb = float(settings['max_config_gb'] or 0)
+    try:
+        expiry_date = datetime.strptime(settings['global_expiry_date'], '%Y-%m-%d')
+    except ValueError:
+        expiry_date = datetime.now() + timedelta(days=30)
+
+    expiry_time_ms = int(datetime(expiry_date.year, expiry_date.month, expiry_date.day, 23, 59, 59).timestamp() * 1000)
+    return {
+        'max_config_gb': max_config_gb,
+        'global_expiry_date': expiry_date.strftime('%Y-%m-%d'),
+        'global_expiry_time_ms': expiry_time_ms,
+    }
 
 
 def has_web_accounts():

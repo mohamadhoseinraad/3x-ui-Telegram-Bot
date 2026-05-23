@@ -29,9 +29,9 @@ def get_vpn_plans_keyboard():
 def get_vpn_extend_plans_keyboard(email):
     keyboard = [
         [InlineKeyboardButton("➕🇩🇪 آلمان 10 گیگ / 1 ماهه 20 هزار تومن", callback_data="extend_gb_10")],
-        [InlineKeyboardButton("➕🇩🇪 آلمان 30 گیگ / 1 ماهه 60 هزار تومن", callback_data="extend_gb_10")],
-        [InlineKeyboardButton("➕🇩🇪 آلمان 40 گیگ / 1 ماهه 80 هزار تومن", callback_data="extend_gb_20")],
-        [InlineKeyboardButton("➕🇩🇪 آلمان 50 گیگ / 1 ماهه 100 هزار تومن", callback_data="extend_gb_30")],
+        [InlineKeyboardButton("➕🇩🇪 آلمان 30 گیگ / 1 ماهه 60 هزار تومن", callback_data="extend_gb_30")],
+        [InlineKeyboardButton("➕🇩🇪 آلمان 40 گیگ / 1 ماهه 80 هزار تومن", callback_data="extend_gb_40")],
+        [InlineKeyboardButton("➕🇩🇪 آلمان 50 گیگ / 1 ماهه 100 هزار تومن", callback_data="extend_gb_50")],
         [InlineKeyboardButton("🔙 بازگشت", callback_data=f"status_{email}")]
     ]
     return keyboard

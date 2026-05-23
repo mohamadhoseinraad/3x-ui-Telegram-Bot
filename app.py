@@ -8,7 +8,7 @@ import sqlite3
 import string
 import time
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 from functools import wraps
 
 from flask import Flask, flash, redirect, render_template, request, session, url_for
@@ -34,6 +34,8 @@ from database import (
     get_user_configs,
     get_user_tickets,
     has_web_accounts,
+    get_service_policy,
+    update_app_settings,
     list_invite_codes,
     init_db,
     save_new_config,
@@ -120,12 +122,32 @@ def admin_required(func):
 
 
 def _parse_plan_gb(plan_name):
-    first = plan_name.split()[0]
-    if first.isdigit():
-        return int(first)
-    # Extension format: "تمدید 10GB"
-    digits = "".join(ch for ch in plan_name if ch.isdigit())
-    return int(digits) if digits else 0
+    import re
+
+    if not plan_name:
+        return 0
+
+    # Normalize Persian/Arabic digits to ASCII
+    persian_digits = "۰۱۲۳۴۵۶۷۸۹"
+    arabic_digits = "٠١٢٣٤٥٦٧٨٩"
+    trans = {}
+    for i, d in enumerate(persian_digits):
+        trans[ord(d)] = ord(str(i))
+    for i, d in enumerate(arabic_digits):
+        trans[ord(d)] = ord(str(i))
+    normalized = plan_name.translate(trans)
+
+    # Look for an explicit GB marker near a number (e.g. '10 گیگ', '10GB')
+    m = re.search(r'(\d+(?:[.,]\d+)?)\s*(?:گیگابایت|گیگاب|گیگ|GB|G)\b', normalized, re.IGNORECASE)
+    if m:
+        return float(m.group(1).replace(',', '.'))
+
+    # Fallback: take the first standalone number token found
+    m = re.search(r'(\d+(?:[.,]\d+)?)', normalized)
+    if m:
+        return float(m.group(1).replace(',', '.'))
+
+    return 0
 
 
 def _db_connection():
@@ -180,6 +202,12 @@ def _create_web_only_user(username):
         return next_user_id
     finally:
         conn.close()
+
+
+def _config_limit_allows(total_gb):
+    policy = get_service_policy()
+    max_config_gb = policy['max_config_gb']
+    return max_config_gb <= 0 or total_gb <= max_config_gb
 
 
 @app.route("/")
@@ -347,6 +375,11 @@ def free_trial():
         return redirect(url_for("dashboard"))
 
     gb_amount = int(trial_size)
+    policy = get_service_policy()
+    if policy['max_config_gb'] > 0 and gb_amount > policy['max_config_gb']:
+        flash(f"Trial size exceeds the configured limit of {policy['max_config_gb']} GB.", "error")
+        return redirect(url_for("dashboard"))
+
     if check_trial_usage(user_id, gb_amount):
         flash(f"You already used the {gb_amount}GB trial.", "error")
         return redirect(url_for("dashboard"))
@@ -358,8 +391,7 @@ def free_trial():
         email = f"u{user_id}_{suffix}@free_{gb_amount}_gb"
 
     total_bytes = gb_amount * (1024 ** 3)
-    days = 1 if gb_amount == 1 else 7
-    expiry_time = int(time.time() + days * 86400) * 1000
+    expiry_time = policy['global_expiry_time_ms']
 
     client_id, error = create_client(email, total_bytes, expiry_time)
     if error:
@@ -392,6 +424,11 @@ def buy_service():
             return redirect(url_for("buy_service"))
 
         plan = VPN_PLANS[plan_key]
+        policy = get_service_policy()
+        if policy['max_config_gb'] > 0 and float(plan.get("gb", 0)) > policy['max_config_gb']:
+            flash(f"Plan exceeds the configured limit of {policy['max_config_gb']} GB.", "error")
+            return redirect(url_for("buy_service"))
+
         payment_id = save_payment_request(current_user_id(), plan["name"], receipt_text)
         flash(f"Payment request #{payment_id} submitted and waiting for admin approval.", "success")
         return redirect(url_for("dashboard"))
@@ -421,14 +458,21 @@ def extend_config_request():
         return redirect(url_for("configs_view"))
 
     gb_amount = int(gb_amount_raw)
+    policy = get_service_policy()
     client_id = None
+    current_total_gb = None
     for conf in get_user_configs(user_id):
         if conf[1] == email:
             client_id = conf[2]
+            current_total_gb = float(conf[3])
             break
 
     if not client_id:
         flash("Config not found.", "error")
+        return redirect(url_for("configs_view"))
+
+    if policy['max_config_gb'] > 0 and current_total_gb is not None and current_total_gb + gb_amount > policy['max_config_gb']:
+        flash(f"This extension would exceed the configured limit of {policy['max_config_gb']} GB.", "error")
         return redirect(url_for("configs_view"))
 
     # Keep extension details encoded in plan+receipt so it survives process restarts.
@@ -507,7 +551,41 @@ def ticket_detail(ticket_id):
 @admin_required
 def admin_dashboard():
     invite_codes = list_invite_codes()
-    return render_template("admin_dashboard.html", invite_codes=invite_codes)
+    policy = get_service_policy()
+    return render_template("admin_dashboard.html", invite_codes=invite_codes, policy=policy)
+
+
+@app.route("/admin/settings", methods=["POST"])
+@login_required
+@admin_required
+def admin_update_settings():
+    max_config_gb_raw = request.form.get("max_config_gb", "").strip()
+    global_expiry_date = request.form.get("global_expiry_date", "").strip()
+
+    if max_config_gb_raw:
+        try:
+            max_config_gb = float(max_config_gb_raw)
+            if max_config_gb < 0:
+                raise ValueError
+        except ValueError:
+            flash("Max GB must be a non-negative number.", "error")
+            return redirect(url_for("admin_dashboard"))
+    else:
+        max_config_gb = 0
+
+    if not global_expiry_date:
+        flash("Global expiry date is required.", "error")
+        return redirect(url_for("admin_dashboard"))
+
+    try:
+        datetime.strptime(global_expiry_date, "%Y-%m-%d")
+    except ValueError:
+        flash("Global expiry date must be in YYYY-MM-DD format.", "error")
+        return redirect(url_for("admin_dashboard"))
+
+    update_app_settings(max_config_gb=max_config_gb, global_expiry_date=global_expiry_date)
+    flash("Service policy updated.", "success")
+    return redirect(url_for("admin_dashboard"))
 
 
 @app.route("/admin/invite-codes/create", methods=["POST"])
@@ -551,6 +629,25 @@ def approve_payment_web(payment_id):
 
     user_id, plan_name, username = payment_info
     plan_gb = _parse_plan_gb(plan_name)
+    policy = get_service_policy()
+
+    # Normalize and log values for debugging approval issues
+    # try:
+    #     plan_gb = float(plan_gb)
+    # except Exception:
+    #     logger.warning("Could not coerce plan_gb to float: %r", plan_gb)
+    #     try:
+    #         plan_gb = float(int(plan_gb))
+    #     except Exception:
+    #         plan_gb = 0.0
+
+    logger.info(
+        "approve_payment_web: payment_id=%s plan_name=%r plan_gb=%s policy_max=%s",
+        payment_id,
+        plan_name,
+        plan_gb,
+        policy.get("max_config_gb"),
+    )
 
     conn = _db_connection()
     payment_row = conn.execute(
@@ -565,7 +662,14 @@ def approve_payment_web(payment_id):
     try:
         if is_extension:
             _prefix, email, client_id, _receipt_ref = receipt_value.split("::", 3)
-            success, error_msg = extend_client(email, client_id, plan_gb, timedelta(days=30))
+            status = get_client_status(email)
+            if not status:
+                raise RuntimeError("Could not find client information")
+
+            if policy['max_config_gb'] > 0 and status['total_gb'] + plan_gb > policy['max_config_gb']:
+                raise RuntimeError(f"Extension exceeds the configured limit of {policy['max_config_gb']} GB")
+
+            success, error_msg = extend_client(email, client_id, plan_gb, policy['global_expiry_time_ms'])
             if not success:
                 raise RuntimeError(error_msg or "Failed to extend client")
 
@@ -573,14 +677,17 @@ def approve_payment_web(payment_id):
             update_payment_status(payment_id, "approved")
             flash(f"Extension approved for {email}.", "success")
         else:
+            if policy['max_config_gb'] > 0 and plan_gb > policy['max_config_gb']:
+                raise RuntimeError(f"Plan exceeds the configured limit of {policy['max_config_gb']} GB")
+
             suffix = random_suffix()
             user_identifier = username if username else str(user_id)
             email = f"{user_identifier}_{suffix}@vpn"
             if len(email) > 50:
                 email = f"u{user_id}_{suffix}@vpn"
 
-            total_bytes = plan_gb * (1024 ** 3)
-            expiry_time = int(time.time() + 30 * 86400) * 1000
+            total_bytes = int(round(plan_gb * (1024 ** 3)))
+            expiry_time = policy['global_expiry_time_ms']
 
             client_id, error = create_client(email, total_bytes, expiry_time)
             if error:
