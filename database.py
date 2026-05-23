@@ -720,3 +720,45 @@ def update_config_total_gb(email, user_id, additional_gb, extend_days=30):
     conn.commit()
     conn.close()
     return True
+
+
+def delete_config_by_client_id(client_id):
+    """Delete a configuration from the database by client_id
+
+    Args:
+        client_id (str): The client ID to delete
+
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    try:
+        # Find the config_id first (needed for cascading deletions)
+        cursor.execute('SELECT config_id FROM configs WHERE client_id = ?', (client_id,))
+        result = cursor.fetchone()
+
+        if not result:
+            logger.warning(f"No config found with client_id: {client_id}")
+            return False
+
+        config_id = result[0]
+
+        # Delete related records in status_logs first due to foreign key constraint
+        cursor.execute('DELETE FROM status_logs WHERE config_id = ?', (config_id,))
+
+        # Delete the config record
+        cursor.execute('DELETE FROM configs WHERE client_id = ?', (client_id,))
+
+        deleted_count = cursor.rowcount
+        conn.commit()
+
+        logger.info(f"Deleted config with client_id: {client_id} (affected rows: {deleted_count})")
+        return deleted_count > 0
+    except Exception as e:
+        logger.error(f"Error deleting config with client_id {client_id}: {e}")
+        conn.rollback()
+        return False
+    finally:
+        conn.close()
