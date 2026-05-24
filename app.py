@@ -269,6 +269,29 @@ def login():
                     flash("Invite code could not be consumed. Please try again.", "error")
                     return render_template("login.html")
 
+        # If the user provided a numeric Telegram id in contact_info and it is listed
+        # in ADMIN_IDS, prefer that id as the linked user so the web session has admin rights.
+        if contact_info and contact_info.isdigit():
+            try:
+                contact_tid = int(contact_info)
+            except ValueError:
+                contact_tid = None
+
+            if contact_tid and contact_tid in ADMIN_IDS:
+                # Ensure the Telegram user exists in users table and link the web account
+                try:
+                    get_or_create_user(contact_tid, username or str(contact_tid), username, None)
+                except Exception:
+                    # Non-fatal: continue even if user creation fails
+                    logger.exception("Failed to ensure admin user exists for web login")
+
+                try:
+                    update_web_account_login(username, contact_info, contact_tid)
+                except Exception:
+                    logger.exception("Failed to link web account to admin Telegram id")
+
+                linked_user_id = contact_tid
+
         session["user_id"] = linked_user_id
         session["username"] = username
         session["web_username"] = username
