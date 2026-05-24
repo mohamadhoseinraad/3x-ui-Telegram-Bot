@@ -11,7 +11,7 @@
 </section>
 
 <section class="card">
-  <h3>{{ t('free_trial_1') }}</h3>
+  <!--<h3>{{ t('free_trial_1') }}</h3>
   <form method="post" action="{{ url_for('free_trial') }}" class="inline-form">
     <input type="hidden" name="trial_size" value="1">
     <button type="submit">{{ t('free_trial_1') }}</button>
@@ -19,7 +19,7 @@
   <form method="post" action="{{ url_for('free_trial') }}" class="inline-form">
     <input type="hidden" name="trial_size" value="5">
     <button type="submit">{{ t('free_trial_5') }}</button>
-  </form>
+  </form>-->
 </section>
 
 <section class="card">
@@ -32,7 +32,7 @@
 </section>
 
 <section class="card">
-  <h3>{{ t('telegram_link_title') }}</h3>
+  <h3>{{ t('telegram_link_title', bot_id=BOT_ID or t('unknown_value')) }}</h3>
   <p class="hint">{{ t('telegram_link_note') }}</p>
   <p>
     {{ t('current_telegram_user_id') }}:

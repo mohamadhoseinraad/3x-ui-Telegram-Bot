@@ -16,7 +16,7 @@ from flask import make_response
 from werkzeug.security import check_password_hash, generate_password_hash
 
 import config
-from config import ADMIN_IDS, DB_FILE, HOST, IPDOMAIN, PORT, SNI, payment_msg
+from config import ADMIN_IDS, BOT_ID, DB_FILE, HOST, IPDOMAIN, PORT, SNI, payment_msg
 from database import (
     add_ticket_message,
     consume_invite_code,
@@ -68,7 +68,7 @@ def inject_globals():
     def t(key, **kwargs):
         return translate(key, lang, **kwargs)
 
-    return {"ADMIN_IDS": ADMIN_IDS, "t": t, "lang": lang, "dir": dir}
+    return {"ADMIN_IDS": ADMIN_IDS, "BOT_ID": BOT_ID, "t": t, "lang": lang, "dir": dir}
 
 
 @app.route('/set-lang/<lang>')
