@@ -1,8 +1,7 @@
 services:
   web:
-    build:
-      context: .
-    command: python app.py
+    image: ghcr.io/mohamadhoseinraad/3x-ui-telegram-bot:latest
+    command: ["start-web"]
     env_file:
       - .env
     environment:
@@ -14,9 +13,8 @@ services:
     restart: unless-stopped
 
   bot:
-    build:
-      context: .
-    command: python bot.py
+    image: ghcr.io/mohamadhoseinraad/3x-ui-telegram-bot:latest
+    command: ["start-bot"]
     env_file:
       - .env
     environment:
