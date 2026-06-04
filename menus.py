@@ -33,7 +33,7 @@ def build_vpn_plans(policy=None):
         plan_key = plan["plan_key"]
         plan_name = plan["name"]
         if days_until_expiry is not None:
-            plan_name = f"{plan_name} | {int(days_until_expiry)} روزه"
+            plan_name = f"{int(days_until_expiry)} روزه"
 
         plans[plan_key] = {**plan, "name": plan_name}
 
@@ -80,7 +80,7 @@ def get_vpn_extend_plans_keyboard(email, policy=None):
     plans = build_vpn_plans(policy)
     keyboard = []
     for plan_key, plan in plans.items():
-        label = f"➕ {plan['name']} | {plan['gb']:g} گیگ | {_format_price_toman(plan['price'])}"
+        label = f"➕ {plan['gb']:g} گیگ | {_format_price_toman(plan['price'])}"
         keyboard.append([InlineKeyboardButton(label, callback_data=f"extend_plan_{plan_key}")])
     keyboard.append([InlineKeyboardButton("🔙 بازگشت", callback_data=f"status_{email}")])
     return keyboard
