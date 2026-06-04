@@ -5,14 +5,9 @@ import math
 import time
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from database import DEFAULT_VPN_PLANS, get_vpn_plans
 
-# VPN plans
-VPN_PLANS = {
-    "gb_1": {"name": "(1 Gb)", "gb": 1},
-    "gb_2": {"name": "(2 Gb)", "gb": 2},
-    "gb_5": {"name": "(5 Gb)", "gb": 5},
-    "gb_10": {"name": "(10 Gb)", "gb": 10},
-}
+VPN_PLANS = {plan['plan_key']: plan for plan in DEFAULT_VPN_PLANS}
 
 
 def get_days_until_expiry(expiry_time_ms):
@@ -30,15 +25,32 @@ def build_vpn_plans(policy=None):
     plans = {}
     days_until_expiry = get_days_until_expiry((policy or {}).get("global_expiry_time_ms"))
 
-    for plan_key, plan in VPN_PLANS.items():
+    catalog = get_vpn_plans()
+    if not catalog:
+        catalog = DEFAULT_VPN_PLANS
+
+    for plan in catalog:
+        plan_key = plan["plan_key"]
         plan_name = plan["name"]
         if days_until_expiry is not None:
-            plan_name = f"{plan_name} | {days_until_expiry}  روزه"
-            # plan_name = f"{days_until_expiry}  روزه"
+            plan_name = f"روزه {int(days_until_expiry)} "
 
         plans[plan_key] = {**plan, "name": plan_name}
 
     return plans
+
+
+def _format_price_toman(amount):
+    try:
+        n = float(amount)
+    except Exception:
+        return str(amount) + " تومن"
+
+    if n.is_integer():
+        s = f"{int(n):,}"
+    else:
+        s = f"{n:,.2f}".rstrip('0').rstrip('.')
+    return f"{s} تومن"
 
 # Free trial plans
 def get_free_trial_keyboard():
@@ -53,27 +65,31 @@ def get_free_trial_keyboard():
 # Regular VPN plans keyboard
 def get_vpn_plans_keyboard(policy=None):
     plans = build_vpn_plans(policy)
-    return [
-        [InlineKeyboardButton(plans["gb_1"]["name"], callback_data="gb_1")],
-        [InlineKeyboardButton(plans["gb_2"]["name"], callback_data="gb_2")],
-        [InlineKeyboardButton(plans["gb_5"]["name"], callback_data="gb_5")],
-        [InlineKeyboardButton(plans["gb_10"]["name"], callback_data="gb_10")]
-    ]
+    keyboard = []
+    for plan_key, plan in plans.items():
+        label = f"{plan['name']} | {plan['gb']:g} گیگ | {_format_price_toman(plan['price'])}"
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"plan_{plan_key}")])
+
+    if not keyboard:
+        keyboard.append([InlineKeyboardButton("پلنی ثبت نشده است", callback_data="back_to_main")])
+
+    return keyboard
+
+
 def get_vpn_extend_plans_keyboard(email, policy=None):
     plans = build_vpn_plans(policy)
-    keyboard = [
-        [InlineKeyboardButton(f"➕{plans['gb_1']['name']} (بدون تمدید زمانی)", callback_data="extend_gb_1")],
-        [InlineKeyboardButton(f"➕{plans['gb_2']['name']} (بدون تمدید زمانی)", callback_data="extend_gb_2")],
-        [InlineKeyboardButton(f"➕{plans['gb_5']['name']} (بدون تمدید زمانی)", callback_data="extend_gb_5")],
-        [InlineKeyboardButton(f"➕{plans['gb_10']['name']} (بدون تمدید زمانی)", callback_data="extend_gb_10")],
-        [InlineKeyboardButton("🔙 بازگشت", callback_data=f"status_{email}")]
-    ]
+    keyboard = []
+    for plan_key, plan in plans.items():
+        label = f"➕ {plan['name']} | {plan['gb']:g} | {_format_price_toman(plan['price'])}"
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"extend_plan_{plan_key}")])
+    keyboard.append([InlineKeyboardButton("🔙 بازگشت", callback_data=f"status_{email}")])
     return keyboard
 
 # Main menu keyboard
 def get_main_menu_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("خرید سرویس", callback_data="buy_service")],
+        [InlineKeyboardButton("💰 کیف پول", callback_data="wallet_menu")],
         [InlineKeyboardButton("🎁 سرویس هدیه و تست ", callback_data="buy_service_gift")],
         [InlineKeyboardButton("مشاهده وضعیت سرویس", callback_data="check_status")],
         [InlineKeyboardButton("🔧 پشتیبانی", callback_data="support")]
@@ -85,6 +101,21 @@ def get_support_keyboard():
         [InlineKeyboardButton("📩 ایجاد تیکت جدید", callback_data="support_new")],
         [InlineKeyboardButton("📨 تیکت های من", callback_data="support_my_tickets")],
         [InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_main")]
+    ])
+
+
+def get_wallet_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ شارژ کیف پول", callback_data="wallet_topup")],
+        [InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_main")]
+    ])
+
+
+def get_payment_method_keyboard(back_callback="back_to_main"):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💰 پرداخت با کیف پول", callback_data="pay_wallet")],
+        [InlineKeyboardButton("💳 پرداخت مستقیم", callback_data="pay_direct")],
+        [InlineKeyboardButton("🔙 بازگشت", callback_data=back_callback)]
     ])
 
 # Back to main menu button
@@ -135,6 +166,7 @@ def get_admin_menu_keyboard():
         [InlineKeyboardButton("👨‍💻 مدیریت کلاینت ها", callback_data="admin_manage_clients")],
         [InlineKeyboardButton("📢 ارسال پیام به همه", callback_data="admin_broadcast")],
         [InlineKeyboardButton("📜 Service Policy", callback_data="admin_service_policy")],
+            [InlineKeyboardButton("🛠️ مدیریت پلن‌ها", callback_data="admin_plans")],
         [InlineKeyboardButton("⏱️ تنظیم تاریخ انقضای همه کلاینت‌ها", callback_data="admin_extend_all")],
         [InlineKeyboardButton("فعال/غیر فعال سازی فروش", callback_data="admin_buy_allow")]
     ])

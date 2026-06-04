@@ -72,11 +72,11 @@
   <h3>Extend All Clients</h3>
   <form method="post" action="{{ url_for('admin_extend_all') }}" class="inline-form">
     <select name="days">
-      <option value="1">1 day</option>
-      <option value="3">3 days</option>
-      <option value="10">10 days</option>
+      <option value="1">1 روز</option>
+      <option value="3">3 روز</option>
+      <option value="10">10 روز</option>
     </select>
-    <button type="submit">Run Extend</button>
+    <button type="submit">اجرای افزایش تاریخ</button>
   </form>
 </section>
 
@@ -85,6 +85,70 @@
   <form method="post" action="{{ url_for('admin_toggle_buy') }}" class="inline-form">
     <button type="submit" name="enabled" value="yes">Enable</button>
     <button type="submit" name="enabled" value="no" class="danger">Disable</button>
+  </form>
+</section>
+<section class="card">
+  <h3>VPN Plans</h3>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Key</th>
+          <th>Name</th>
+          <th>GB</th>
+          <th>Price</th>
+          <th>Active</th>
+          <th>Sort</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for plan in vpn_plans %}
+        <tr>
+          <td>{{ plan.plan_key }}</td>
+          <td>
+            <form method="post" action="{{ url_for('admin_save_plan') }}" class="inline-form">
+              <input type="hidden" name="plan_key" value="{{ plan.plan_key }}">
+              <input type="text" name="name" value="{{ plan.name }}">
+          </td>
+          <td><input type="number" step="0.1" name="gb" value="{{ plan.gb }}"></td>
+          <td><input type="number" step="0.01" name="price" value="{{ plan.price }}"></td>
+          <td><input type="checkbox" name="is_active" {% if plan.is_active %}checked{% endif %}></td>
+          <td><input type="number" name="sort_order" value="{{ plan.sort_order or 0 }}"></td>
+          <td>
+              <button type="submit">Save</button>
+            </form>
+            <form method="post" action="{{ url_for('admin_delete_plan', plan_key=plan.plan_key) }}" style="display:inline">
+              <button type="submit" class="danger">Delete</button>
+            </form>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="7">No plans defined.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <h4>Add New Plan</h4>
+  <form method="post" action="{{ url_for('admin_save_plan') }}" class="grid-form narrow-form">
+    <label>
+      Name
+      <input type="text" name="name" required>
+    </label>
+    <label>
+      GB
+      <input type="number" name="gb" step="0.1" required>
+    </label>
+    <label>
+      Price
+      <input type="number" name="price" step="0.01" required>
+    </label>
+    <label>
+      Sort Order
+      <input type="number" name="sort_order">
+    </label>
+    <button type="submit">Create Plan</button>
   </form>
 </section>
 {% endblock %}

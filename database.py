@@ -8,6 +8,35 @@ from config import DB_FILE
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_VPN_PLANS = [
+    {'plan_key': 'gb_1', 'name': '1 GB', 'gb': 1, 'price': 1, 'sort_order': 1},
+    {'plan_key': 'gb_2', 'name': '2 GB', 'gb': 2, 'price': 2, 'sort_order': 2},
+    {'plan_key': 'gb_5', 'name': '5 GB', 'gb': 5, 'price': 5, 'sort_order': 3},
+    {'plan_key': 'gb_10', 'name': '10 GB', 'gb': 10, 'price': 10, 'sort_order': 4},
+]
+
+
+def _generate_plan_key(name):
+    import re
+
+    slug = re.sub(r'[^a-zA-Z0-9]+', '_', str(name).strip().lower()).strip('_')
+    return slug or 'plan'
+
+
+def _seed_default_plans(cursor):
+    cursor.execute('SELECT COUNT(*) FROM vpn_plans')
+    if cursor.fetchone()[0]:
+        return
+
+    for plan in DEFAULT_VPN_PLANS:
+        cursor.execute(
+            '''
+            INSERT INTO vpn_plans (plan_key, name, gb, price, sort_order, is_active)
+            VALUES (?, ?, ?, ?, ?, 1)
+            ''',
+            (plan['plan_key'], plan['name'], plan['gb'], plan['price'], plan['sort_order'])
+        )
+
 def init_db():
     """Initialize database tables if they don't exist"""
     conn = sqlite3.connect(DB_FILE)
@@ -19,9 +48,16 @@ def init_db():
         username TEXT,
         first_name TEXT,
         last_name TEXT,
+        wallet_balance REAL DEFAULT 0,
         join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     ''')
+
+    cursor.execute("PRAGMA table_info(users)")
+    user_columns = [column_info[1] for column_info in cursor.fetchall()]
+    if 'wallet_balance' not in user_columns:
+        logger.info("Adding wallet_balance column to users table")
+        cursor.execute('ALTER TABLE users ADD COLUMN wallet_balance REAL DEFAULT 0')
 
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS web_accounts (
@@ -69,6 +105,32 @@ def init_db():
     )
     ''')
 
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS vpn_plans (
+        plan_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        plan_key TEXT UNIQUE NOT NULL,
+        name TEXT NOT NULL,
+        gb REAL NOT NULL,
+        price REAL NOT NULL,
+        sort_order INTEGER DEFAULT 0,
+        is_active BOOLEAN DEFAULT TRUE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
+
+    cursor.execute("PRAGMA table_info(vpn_plans)")
+    plan_columns = [column_info[1] for column_info in cursor.fetchall()]
+    for column_name, column_definition in (
+        ('price', 'REAL DEFAULT 0'),
+        ('sort_order', 'INTEGER DEFAULT 0'),
+        ('is_active', 'BOOLEAN DEFAULT TRUE'),
+        ('updated_at', 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP'),
+    ):
+        if column_name not in plan_columns:
+            logger.info("Adding %s column to vpn_plans table", column_name)
+            cursor.execute(f'ALTER TABLE vpn_plans ADD COLUMN {column_name} {column_definition}')
+
     default_expiry_date = (datetime.now() + timedelta(days=30)).strftime('%Y-%m-%d')
     cursor.execute(
         'INSERT OR IGNORE INTO app_settings (setting_key, setting_value) VALUES (?, ?)',
@@ -78,6 +140,8 @@ def init_db():
         'INSERT OR IGNORE INTO app_settings (setting_key, setting_value) VALUES (?, ?)',
         ('global_expiry_date', default_expiry_date)
     )
+
+    _seed_default_plans(cursor)
 
     # Check if last_notified column exists in configs table
     cursor.execute("PRAGMA table_info(configs)")
@@ -108,12 +172,32 @@ def init_db():
         user_id INTEGER,
         plan TEXT,
         receipt_file_id TEXT,
+        payment_type TEXT DEFAULT 'service',
+        amount REAL DEFAULT 0,
+        target_email TEXT,
+        target_client_id TEXT,
+        plan_key TEXT,
+        plan_gb REAL DEFAULT 0,
         status TEXT DEFAULT 'pending',
         submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         approved_at TIMESTAMP,
         FOREIGN KEY (user_id) REFERENCES users (user_id)
     )
     ''')
+
+    cursor.execute("PRAGMA table_info(payments)")
+    payment_columns = [column_info[1] for column_info in cursor.fetchall()]
+    for column_name, column_definition in (
+        ('payment_type', "TEXT DEFAULT 'service'"),
+        ('amount', 'REAL DEFAULT 0'),
+        ('target_email', 'TEXT'),
+        ('target_client_id', 'TEXT'),
+        ('plan_key', 'TEXT'),
+        ('plan_gb', 'REAL DEFAULT 0'),
+    ):
+        if column_name not in payment_columns:
+            logger.info("Adding %s column to payments table", column_name)
+            cursor.execute(f'ALTER TABLE payments ADD COLUMN {column_name} {column_definition}')
 
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS tickets (
@@ -157,6 +241,58 @@ def get_or_create_user(user_id, username, first_name, last_name):
     conn.commit()
     conn.close()
     return user_id
+
+
+def get_wallet_balance(user_id):
+    """Return the current wallet balance for a user."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        'SELECT COALESCE(wallet_balance, 0) FROM users WHERE user_id = ?',
+        (user_id,)
+    )
+    result = cursor.fetchone()
+    conn.close()
+
+    if not result:
+        return 0.0
+
+    return float(result[0] or 0)
+
+
+def adjust_wallet_balance(user_id, amount):
+    """Add or subtract funds from a user's wallet.
+
+    Returns:
+        tuple[bool, float]: (success, resulting_balance)
+    """
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        'SELECT COALESCE(wallet_balance, 0) FROM users WHERE user_id = ?',
+        (user_id,)
+    )
+    result = cursor.fetchone()
+    if not result:
+        conn.close()
+        return False, 0.0
+
+    current_balance = float(result[0] or 0)
+    new_balance = current_balance + float(amount)
+
+    if new_balance < -0.000001:
+        conn.close()
+        return False, current_balance
+
+    cursor.execute(
+        'UPDATE users SET wallet_balance = ? WHERE user_id = ?',
+        (new_balance, user_id)
+    )
+    conn.commit()
+    conn.close()
+    return True, new_balance
 
 
 def get_web_account(username):
@@ -315,9 +451,9 @@ def link_web_account_to_telegram_id(username, telegram_user_id, first_name=None,
     try:
         conn.execute('BEGIN')
 
-        cursor.execute('SELECT user_id, username, first_name, last_name FROM users WHERE user_id = ?', (telegram_user_id,))
+        cursor.execute('SELECT user_id, username, first_name, last_name, COALESCE(wallet_balance, 0) AS wallet_balance FROM users WHERE user_id = ?', (telegram_user_id,))
         target_user = cursor.fetchone()
-        cursor.execute('SELECT user_id, username, first_name, last_name FROM users WHERE user_id = ?', (current_user_id,))
+        cursor.execute('SELECT user_id, username, first_name, last_name, COALESCE(wallet_balance, 0) AS wallet_balance FROM users WHERE user_id = ?', (current_user_id,))
         source_user = cursor.fetchone() if current_user_id is not None else None
 
         fallback_username = username
@@ -362,6 +498,10 @@ def link_web_account_to_telegram_id(username, telegram_user_id, first_name=None,
             else:
                 if source_user is not None:
                     update_foreign_keys(current_user_id, telegram_user_id)
+                    cursor.execute(
+                        'UPDATE users SET wallet_balance = COALESCE(wallet_balance, 0) + ? WHERE user_id = ?',
+                        (float(source_user['wallet_balance'] or 0), telegram_user_id)
+                    )
                     cursor.execute('DELETE FROM users WHERE user_id = ?', (current_user_id,))
                 cursor.execute(
                     '''
@@ -511,20 +651,44 @@ def log_status_check(config_id, remaining_gb, remaining_days):
     conn.commit()
     conn.close()
 
-def save_payment_request(user_id, plan_name, file_id):
+def save_payment_request(user_id, plan_name, file_id, payment_type='service', amount=0, target_email=None, target_client_id=None, plan_key=None, plan_gb=None):
     """Save a payment request"""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
 
     cursor.execute('''
-    INSERT INTO payments (user_id, plan, receipt_file_id)
-    VALUES (?, ?, ?)
-    ''', (user_id, plan_name, file_id))
+    INSERT INTO payments (user_id, plan, receipt_file_id, payment_type, amount, target_email, target_client_id, plan_key, plan_gb)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (user_id, plan_name, file_id, payment_type, amount, target_email, target_client_id, plan_key, plan_gb))
 
     payment_id = cursor.lastrowid
     conn.commit()
     conn.close()
     return payment_id
+
+
+def get_payment_record(payment_id):
+    """Return the full payment row for approval flows."""
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    cursor.execute(
+        '''
+        SELECT p.payment_id, p.user_id, p.plan, p.receipt_file_id, p.payment_type,
+             COALESCE(p.amount, 0) AS amount, p.target_email, p.target_client_id,
+             p.plan_key, COALESCE(p.plan_gb, 0) AS plan_gb,
+               p.status, p.submitted_at, p.approved_at,
+               u.username, u.first_name
+        FROM payments p
+        JOIN users u ON p.user_id = u.user_id
+        WHERE p.payment_id = ?
+        ''',
+        (payment_id,)
+    )
+    record = cursor.fetchone()
+    conn.close()
+    return record
 
 def update_payment_status(payment_id, status, approved_at=None):
     """Update the status of a payment"""
@@ -980,7 +1144,7 @@ def get_pending_payments():
     cursor = conn.cursor()
 
     cursor.execute('''
-    SELECT p.payment_id, p.user_id, p.plan, u.first_name, u.username, p.receipt_file_id
+    SELECT p.payment_id, p.user_id, p.plan, u.first_name, u.username, p.receipt_file_id, p.payment_type, COALESCE(p.amount, 0), p.plan_key, COALESCE(p.plan_gb, 0)
     FROM payments p
     JOIN users u ON p.user_id = u.user_id
     WHERE p.status = 'pending'
@@ -1076,6 +1240,86 @@ def update_config_total_gb(email, user_id, additional_gb, extend_days=30):
     conn.commit()
     conn.close()
     return True
+
+
+def get_vpn_plans(include_inactive=False):
+    """Return configured VPN plans ordered for display."""
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    query = 'SELECT plan_id, plan_key, name, gb, price, sort_order, is_active FROM vpn_plans'
+    if not include_inactive:
+        query += ' WHERE is_active = 1'
+    query += ' ORDER BY sort_order ASC, plan_id ASC'
+
+    cursor.execute(query)
+    plans = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return plans
+
+
+def get_vpn_plan(plan_key):
+    """Return a VPN plan by key."""
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    cursor.execute(
+        '''
+        SELECT plan_id, plan_key, name, gb, price, sort_order, is_active
+        FROM vpn_plans
+        WHERE plan_key = ?
+        ''',
+        (plan_key,)
+    )
+    plan = cursor.fetchone()
+    conn.close()
+    return dict(plan) if plan else None
+
+
+def save_vpn_plan(name, gb, price, plan_key=None, is_active=True, sort_order=None):
+    """Insert or update a VPN plan."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    if plan_key is None:
+        plan_key = _generate_plan_key(name)
+
+    if sort_order is None:
+        cursor.execute('SELECT COALESCE(MAX(sort_order), 0) + 1 FROM vpn_plans')
+        sort_order = cursor.fetchone()[0]
+
+    cursor.execute(
+        '''
+        INSERT INTO vpn_plans (plan_key, name, gb, price, sort_order, is_active, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(plan_key) DO UPDATE SET
+            name = excluded.name,
+            gb = excluded.gb,
+            price = excluded.price,
+            sort_order = excluded.sort_order,
+            is_active = excluded.is_active,
+            updated_at = CURRENT_TIMESTAMP
+        ''',
+        (plan_key, name, float(gb), float(price), int(sort_order), 1 if is_active else 0)
+    )
+
+    conn.commit()
+    conn.close()
+    return plan_key
+
+
+def delete_vpn_plan(plan_key):
+    """Delete a VPN plan by key."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    cursor.execute('DELETE FROM vpn_plans WHERE plan_key = ?', (plan_key,))
+    deleted = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
 
 
 def delete_config_by_client_id(client_id):

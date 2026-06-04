@@ -29,8 +29,12 @@ from database import (
     get_invite_code,
     get_web_account,
     get_payment_info,
+    get_payment_record,
     get_pending_payments,
     get_ticket_conversation,
+    get_vpn_plans,
+    save_vpn_plan,
+    delete_vpn_plan,
     get_user_configs,
     get_user_tickets,
     has_web_accounts,
@@ -44,10 +48,12 @@ from database import (
     link_web_account_to_telegram_id,
     update_config_active_status,
     update_config_total_gb,
+    adjust_wallet_balance,
     update_payment_status,
     update_ticket_status,
     update_web_account_login,
     verify_ticket_access,
+    get_wallet_balance,
 )
 from db_utils import delete_config_by_client_id, get_all_db_configs
 from menus import VPN_PLANS, build_vpn_plans
@@ -438,7 +444,8 @@ def buy_service():
         plan_key = request.form.get("plan_key", "")
         receipt_text = request.form.get("receipt", "").strip()
 
-        if plan_key not in VPN_PLANS:
+        plans = build_vpn_plans(get_service_policy())
+        if plan_key not in plans:
             flash("Invalid plan.", "error")
             return redirect(url_for("buy_service"))
 
@@ -446,13 +453,23 @@ def buy_service():
             flash("Receipt/reference is required.", "error")
             return redirect(url_for("buy_service"))
 
-        plan = VPN_PLANS[plan_key]
+        plan = plans[plan_key]
         policy = get_service_policy()
         if policy['max_config_gb'] > 0 and float(plan.get("gb", 0)) > policy['max_config_gb']:
             flash(f"Plan exceeds the configured limit of {policy['max_config_gb']} GB.", "error")
             return redirect(url_for("buy_service"))
 
-        payment_id = save_payment_request(current_user_id(), plan["name"], receipt_text)
+        payment_id = save_payment_request(
+            current_user_id(),
+            plan["name"],
+            receipt_text,
+            "web",
+            plan.get("price"),
+            None,
+            None,
+            plan_key=plan_key,
+            plan_gb=plan.get("gb"),
+        )
         flash(f"Payment request #{payment_id} submitted and waiting for admin approval.", "success")
         return redirect(url_for("dashboard"))
 
@@ -498,11 +515,34 @@ def extend_config_request():
         flash(f"This extension would exceed the configured limit of {policy['max_config_gb']} GB.", "error")
         return redirect(url_for("configs_view"))
 
-    # Keep extension details encoded in plan+receipt so it survives process restarts.
-    plan_name = f"تمدید {gb_amount}GB"
-    receipt_payload = f"EXT::{email}::{client_id}::{receipt_text}"
-
-    payment_id = save_payment_request(user_id, plan_name, receipt_payload)
+    # Support selecting a named plan for extension (admin-managed plans)
+    plan_key = request.form.get("plan_key", "").strip()
+    plans = build_vpn_plans(get_service_policy())
+    if plan_key:
+        if plan_key not in plans:
+            flash("Invalid plan selected.", "error")
+            return redirect(url_for("configs_view"))
+        plan = plans[plan_key]
+        plan_gb = int(plan.get("gb", gb_amount))
+        amount = plan.get("price")
+        plan_name = f"تمدید {plan_gb}GB"
+        receipt_payload = f"EXT::{email}::{client_id}::{receipt_text}"
+        payment_id = save_payment_request(
+            user_id,
+            plan_name,
+            receipt_payload,
+            "web",
+            amount,
+            None,
+            None,
+            plan_key=plan_key,
+            plan_gb=plan_gb,
+        )
+    else:
+        # Keep extension details encoded in plan+receipt so it survives process restarts.
+        plan_name = f"تمدید {gb_amount}GB"
+        receipt_payload = f"EXT::{email}::{client_id}::{receipt_text}"
+        payment_id = save_payment_request(user_id, plan_name, receipt_payload, "web")
     flash(f"Extension payment request #{payment_id} submitted.", "success")
     return redirect(url_for("configs_view"))
 
@@ -575,7 +615,8 @@ def ticket_detail(ticket_id):
 def admin_dashboard():
     invite_codes = list_invite_codes()
     policy = get_service_policy()
-    return render_template("admin_dashboard.html", invite_codes=invite_codes, policy=policy)
+    vpn_plans = get_vpn_plans(include_inactive=True)
+    return render_template("admin_dashboard.html", invite_codes=invite_codes, policy=policy, vpn_plans=vpn_plans)
 
 
 @app.route("/admin/settings", methods=["POST"])
@@ -633,6 +674,46 @@ def admin_create_invite_code():
     return redirect(url_for("admin_dashboard"))
 
 
+@app.route("/admin/plans", methods=["POST"])
+@login_required
+@admin_required
+def admin_save_plan():
+    name = request.form.get("name", "").strip()
+    gb_raw = request.form.get("gb", "").strip()
+    price_raw = request.form.get("price", "").strip()
+    plan_key = request.form.get("plan_key", "").strip() or None
+    is_active = request.form.get("is_active", "on") in ("on", "1", "true", "True")
+    sort_order_raw = request.form.get("sort_order", "").strip()
+
+    if not name or not gb_raw or not price_raw:
+        flash("Name, GB and price are required for a plan.", "error")
+        return redirect(url_for("admin_dashboard"))
+
+    try:
+        gb = float(gb_raw)
+        price = float(price_raw)
+    except ValueError:
+        flash("GB and price must be numeric.", "error")
+        return redirect(url_for("admin_dashboard"))
+
+    sort_order = int(sort_order_raw) if sort_order_raw.isdigit() else None
+    plan_key = save_vpn_plan(name, gb, price, plan_key=plan_key, is_active=is_active, sort_order=sort_order)
+    flash(f"Plan {plan_key} saved.", "success")
+    return redirect(url_for("admin_dashboard"))
+
+
+@app.route("/admin/plans/<plan_key>/delete", methods=["POST"])
+@login_required
+@admin_required
+def admin_delete_plan(plan_key):
+    deleted = delete_vpn_plan(plan_key)
+    if deleted:
+        flash(f"Plan {plan_key} deleted.", "success")
+    else:
+        flash(f"Plan {plan_key} not found.", "error")
+    return redirect(url_for("admin_dashboard"))
+
+
 @app.route("/admin/pending")
 @login_required
 @admin_required
@@ -645,13 +726,17 @@ def admin_pending():
 @login_required
 @admin_required
 def approve_payment_web(payment_id):
-    payment_info = get_payment_info(payment_id)
-    if not payment_info:
+    payment_record = get_payment_record(payment_id)
+    if not payment_record or payment_record["status"] != "pending":
         flash("Payment not found or already processed.", "error")
         return redirect(url_for("admin_pending"))
 
-    user_id, plan_name, username = payment_info
-    plan_gb = _parse_plan_gb(plan_name)
+    user_id = payment_record["user_id"]
+    plan_name = payment_record["plan"]
+    username = payment_record["username"]
+    payment_type = payment_record["payment_type"] or "service"
+    payment_amount = float(payment_record["amount"] or 0)
+    plan_gb = payment_amount if payment_amount > 0 else _parse_plan_gb(plan_name)
     policy = get_service_policy()
 
     # Normalize and log values for debugging approval issues
@@ -672,33 +757,42 @@ def approve_payment_web(payment_id):
         policy.get("max_config_gb"),
     )
 
-    conn = _db_connection()
-    payment_row = conn.execute(
-        "SELECT receipt_file_id FROM payments WHERE payment_id = ?",
-        (payment_id,),
-    ).fetchone()
-    conn.close()
+    if payment_type == "wallet_topup":
+        success, new_balance = adjust_wallet_balance(user_id, payment_amount)
+        if not success:
+            flash("Unable to charge wallet.", "error")
+            return redirect(url_for("admin_pending"))
 
-    receipt_value = payment_row["receipt_file_id"] if payment_row else ""
-    is_extension = receipt_value.startswith("EXT::")
+        update_payment_status(payment_id, "approved")
+        flash(
+            f"Wallet top-up approved for user {user_id}. New balance: {new_balance:g}",
+            "success",
+        )
+        return redirect(url_for("admin_pending"))
+
+    is_extension = payment_type == "extension"
+    extension_email = payment_record["target_email"]
+    extension_client_id = payment_record["target_client_id"]
 
     try:
+        if is_extension and (not extension_email or not extension_client_id):
+            raise RuntimeError("Stored extension details are incomplete")
+
         if is_extension:
-            _prefix, email, client_id, _receipt_ref = receipt_value.split("::", 3)
-            status = get_client_status(email)
+            status = get_client_status(extension_email)
             if not status:
                 raise RuntimeError("Could not find client information")
 
             if policy['max_config_gb'] > 0 and status['total_gb'] + plan_gb > policy['max_config_gb']:
                 raise RuntimeError(f"Extension exceeds the configured limit of {policy['max_config_gb']} GB")
 
-            success, error_msg = extend_client(email, client_id, plan_gb, policy['global_expiry_time_ms'])
+            success, error_msg = extend_client(extension_email, extension_client_id, plan_gb, policy['global_expiry_time_ms'])
             if not success:
                 raise RuntimeError(error_msg or "Failed to extend client")
 
-            update_config_total_gb(email, user_id, plan_gb)
+            update_config_total_gb(extension_email, user_id, plan_gb)
             update_payment_status(payment_id, "approved")
-            flash(f"Extension approved for {email}.", "success")
+            flash(f"Extension approved for {extension_email}.", "success")
         else:
             if policy['max_config_gb'] > 0 and plan_gb > policy['max_config_gb']:
                 raise RuntimeError(f"Plan exceeds the configured limit of {policy['max_config_gb']} GB")
@@ -731,8 +825,8 @@ def approve_payment_web(payment_id):
 @login_required
 @admin_required
 def reject_payment_web(payment_id):
-    payment_info = get_payment_info(payment_id)
-    if not payment_info:
+    payment_record = get_payment_record(payment_id)
+    if not payment_record or payment_record["status"] != "pending":
         flash("Payment not found or already processed.", "error")
         return redirect(url_for("admin_pending"))
 

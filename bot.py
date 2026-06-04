@@ -27,17 +27,18 @@ from config import BOT_TOKEN, ADMIN_IDS, IPDOMAIN, PORT, HOST, SNI, DB_FILE, ALL
 from database import (
     init_db, get_or_create_user, get_user_configs, save_new_config,
     update_config_active_status, get_client_id_by_email, check_trial_usage,
-    save_payment_request, get_all_users,
+    save_payment_request, get_all_users, get_wallet_balance, adjust_wallet_balance,
     create_ticket, add_ticket_message, close_ticket, update_ticket_status, verify_ticket_access,
-    get_formatted_user_tickets, get_ticket_conversation, get_payment_info, update_payment_status,
+    get_formatted_user_tickets, get_ticket_conversation, get_payment_record, update_payment_status,
     get_pending_payments, update_config_total_gb, get_all_configs_with_users,
     get_service_policy, update_app_settings
 )
+from database import get_vpn_plans, save_vpn_plan, delete_vpn_plan
 from menus import (
-    VPN_PLANS, get_main_menu_keyboard, get_free_trial_keyboard, get_vpn_plans_keyboard,
+    build_vpn_plans, get_main_menu_keyboard, get_free_trial_keyboard, get_vpn_plans_keyboard,
     get_back_to_main_button, get_configs_keyboard, get_config_status_keyboard,
     get_admin_approval_keyboard, get_support_keyboard, get_admin_menu_keyboard, get_vpn_extend_plans_keyboard,
-    get_buy_allow_keyboard, get_extend_all_client_day
+    get_buy_allow_keyboard, get_extend_all_client_day, get_wallet_keyboard, get_payment_method_keyboard
 )
 from xui_api import get_client_status, create_client, extend_client
 from notification_service import start_notification_service
@@ -87,6 +88,184 @@ def _parse_plan_gb(plan_name):
         return float(match.group(1).replace(',', '.'))
 
     return 0.0
+
+
+def _format_wallet_amount(amount):
+    """Format a wallet balance or charge amount for display."""
+    try:
+        numeric_amount = float(amount)
+    except (TypeError, ValueError):
+        return str(amount)
+
+    if numeric_amount.is_integer():
+        return str(int(numeric_amount))
+
+    return f"{numeric_amount:g}"
+
+
+def _format_price_toman(amount):
+    """Format numeric amount with thousands separators and append 'تومن'."""
+    try:
+        n = float(amount)
+    except Exception:
+        return str(amount) + " تومن"
+
+    if n.is_integer():
+        s = f"{int(n):,}"
+    else:
+        s = f"{n:,.2f}".rstrip('0').rstrip('.')
+    return f"{s} تومن"
+
+
+def _build_order(kind, label, gb, amount, back_callback, email=None, client_id=None, plan_key=None):
+    """Store the pending purchase or extension request in user_data."""
+    return {
+        'kind': kind,
+        'label': label,
+        'gb': float(gb) if gb is not None else 0,
+        'amount': float(amount),
+        'back_callback': back_callback,
+        'email': email,
+        'client_id': client_id,
+        'plan_key': plan_key,
+    }
+
+
+def _clear_payment_context(context: ContextTypes.DEFAULT_TYPE):
+    """Remove temporary payment-related state from user data."""
+    for key in (
+        'pending_order',
+        'awaiting_direct_receipt',
+        'awaiting_wallet_topup_amount',
+        'awaiting_wallet_topup_receipt',
+        'wallet_topup_amount',
+    ):
+        context.user_data.pop(key, None)
+
+
+async def _send_payment_notification(context: ContextTypes.DEFAULT_TYPE, payment_id, user, order, receipt_file_id, payment_type):
+    """Notify admins about a new payment request."""
+    extension_info = ''
+    if order.get('kind') == 'extension' and order.get('email'):
+        extension_info = f"\nتمدید برای: {order['email']}"
+
+    amount_text = _format_wallet_amount(order.get('amount', 0))
+    gb_text = _format_wallet_amount(order.get('gb', 0))
+    payment_label = 'شارژ کیف پول' if payment_type == 'wallet_topup' else 'پرداخت سرویس'
+
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_photo(
+                chat_id=admin_id,
+                photo=receipt_file_id,
+                caption=(
+                    f"درخواست {payment_label}:\n"
+                    f"کاربر: {user.full_name}\n"
+                    f"پلن: {order['label']}\n"
+                    f"حجم: {gb_text} گیگ\n"
+                    f"مبلغ: {_format_price_toman(order.get('amount', 0))}"
+                    f"{extension_info}\n"
+                    f"شناسه پرداخت: {payment_id}"
+                ),
+                reply_markup=get_admin_approval_keyboard(payment_id)
+            )
+        except Exception as exc:
+            logger.error(f"Error notifying admin {admin_id}: {exc}")
+
+
+async def _fulfill_order_with_wallet(query, user_id, context, order):
+    """Create or extend a service immediately using wallet balance."""
+    balance = get_wallet_balance(user_id)
+    cost = float(order['amount'])
+
+    if balance < cost:
+        await query.edit_message_text(
+            f"موجودی کیف پول شما کافی نیست.\n\n"
+            f"موجودی فعلی: {_format_wallet_amount(balance)}\n"
+            f"مبلغ مورد نیاز: {_format_wallet_amount(cost)}\n\n"
+            "می‌توانید کیف پول را شارژ کنید یا پرداخت مستقیم را انتخاب کنید.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ شارژ کیف پول", callback_data="wallet_topup")],
+                [InlineKeyboardButton("💳 پرداخت مستقیم", callback_data="pay_direct")],
+                [InlineKeyboardButton("🔙 بازگشت", callback_data=order['back_callback'])],
+            ])
+        )
+        return False
+
+    policy = get_service_policy()
+
+    try:
+        if order['kind'] == 'extension':
+            email = order['email']
+            client_id = order['client_id']
+            plan_gb = float(order['gb'])
+            status = get_client_status(email)
+            if not status:
+                raise Exception("خطا در دریافت اطلاعات سرویس فعلی")
+
+            if policy['max_config_gb'] > 0 and status['total_gb'] + plan_gb > policy['max_config_gb']:
+                raise Exception(f"تمدید از محدودیت {policy['max_config_gb']} گیگابایت بیشتر می‌شود")
+
+            success, error_msg = extend_client(email, client_id, plan_gb, policy['global_expiry_time_ms'])
+            if not success:
+                raise Exception(f"خطا در تمدید سرویس: {error_msg}")
+
+            if not update_config_total_gb(email, user_id, plan_gb):
+                logger.warning(f"Failed to update database for wallet extension {email}")
+
+            vless_link = generate_vless_link(client_id, email)
+            adjust_wallet_balance(user_id, -cost)
+            await query.edit_message_text(
+                f"✅ تمدید شما با کیف پول انجام شد.\n\n"
+                f"مبلغ کسر شده: {_format_wallet_amount(cost)}\n"
+                f"موجودی باقی‌مانده: {_format_wallet_amount(get_wallet_balance(user_id))}\n\n"
+                f"🔗 لینک کانفیگ شما:\n`{vless_link}`",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(get_back_to_main_button())
+            )
+            return True
+        else:
+            plan_gb = float(order['gb'])
+            if policy['max_config_gb'] > 0 and plan_gb > policy['max_config_gb']:
+                raise Exception(f"پلن از محدودیت {policy['max_config_gb']} گیگابایت بیشتر است")
+
+            client_id = str(uuid.uuid4())
+            suffix = random_suffix()
+            user = query.from_user
+            user_identifier = user.username if user.username else str(user_id)
+            email = f"{user_identifier}_{suffix}@vpn"
+            if len(email) > 50:
+                email = f"u{user_id}_{suffix}@vpn"
+
+            total_bytes = int(round(plan_gb * (1024 ** 3)))
+            expiry_time = policy['global_expiry_time_ms']
+
+            client_id, error = create_client(email, total_bytes, expiry_time)
+            if error:
+                raise Exception(f"خطا در ایجاد کانفیگ: {error}")
+
+            save_new_config(user_id, email, client_id, plan_gb)
+            adjust_wallet_balance(user_id, -cost)
+            vless_link = generate_vless_link(client_id, email)
+
+            await query.edit_message_text(
+                f"✅ پرداخت با کیف پول انجام شد!\n\n"
+                f"مبلغ کسر شده: {_format_wallet_amount(cost)}\n"
+                f"موجودی باقی‌مانده: {_format_wallet_amount(get_wallet_balance(user_id))}\n\n"
+                f"🔗 لینک کانفیگ:\n`{vless_link}`",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(get_back_to_main_button())
+            )
+            return True
+    except Exception as exc:
+        logger.error(f"Wallet payment error: {exc}")
+        await query.edit_message_text(
+            f"⚠️ خطا در پرداخت با کیف پول: {exc}",
+            reply_markup=InlineKeyboardMarkup(get_back_to_main_button())
+        )
+        return False
+
+    return False
 
 # Command handlers
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -153,6 +332,19 @@ async def support_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=get_support_keyboard()
     )
 
+
+async def wallet_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle the /wallet command"""
+    user = update.effective_user
+    get_or_create_user(user.id, user.username, user.first_name, user.last_name)
+
+    balance = get_wallet_balance(user.id)
+    await update.message.reply_text(
+        f"💰 موجودی کیف پول شما: {_format_wallet_amount(balance)}\n\n"
+        "برای شارژ کیف پول از دکمه زیر استفاده کنید.",
+        reply_markup=get_wallet_keyboard()
+    )
+
 # Callback query handlers
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle all callback queries"""
@@ -169,6 +361,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_buy_service(query, user_id)
     elif data == "buy_service_gift":
         await handle_buy_service_gift(query, user_id)
+    elif data == "wallet_menu":
+        await show_wallet_menu(query, user_id)
+    elif data == "wallet_topup":
+        await prompt_wallet_topup_amount(query, context)
+    elif data in ("pay_wallet", "pay_direct"):
+        await handle_payment_method_choice(query, data, user_id, context)
     elif data == "support":
         await handle_support(query, context)
     elif data == "back_to_main":
@@ -179,11 +377,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await refresh_config_status(query, context)
     elif data == "extend_config":
         await show_extend_options(query, context)
-    elif data.startswith("extend_gb_"):
+    elif data.startswith("extend_plan_"):
         await handle_extend_selection(query, data, user_id, context)
     elif data.startswith("status_"):
         await handle_show_status(query, data[7:], user_id)
-    elif data.startswith("gb_"):
+    elif data.startswith("plan_"):
         await handle_plan_selection(query, data, user_id, context)
     elif data.startswith("free_"):
         await handle_free_trial(query, data, user_id, context)
@@ -210,6 +408,61 @@ async def show_main_menu(query):
         "پلن مورد نظر خود را انتخاب کنید:",
         reply_markup=get_main_menu_keyboard()
     )
+
+
+async def show_wallet_menu(query, user_id):
+    """Show the wallet balance and top-up options."""
+    balance = get_wallet_balance(user_id)
+    await query.edit_message_text(
+        f"💰 موجودی کیف پول شما: {_format_wallet_amount(balance)}\n\n"
+        "از این بخش می‌توانید کیف پول خود را شارژ کنید.",
+        reply_markup=get_wallet_keyboard()
+    )
+
+
+async def prompt_wallet_topup_amount(query, context: ContextTypes.DEFAULT_TYPE):
+    """Ask the user to enter a wallet top-up amount."""
+    context.user_data['awaiting_wallet_topup_amount'] = True
+    context.user_data.pop('awaiting_wallet_topup_receipt', None)
+    await query.edit_message_text(
+        "مبلغ شارژ کیف پول را ارسال کنید.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 بازگشت", callback_data="wallet_menu")]
+        ])
+    )
+
+
+async def prompt_direct_receipt(query, context: ContextTypes.DEFAULT_TYPE, order):
+    """Ask the user to send a receipt for a direct payment request."""
+    context.user_data['pending_order'] = order
+    context.user_data['awaiting_direct_receipt'] = True
+    context.user_data.pop('awaiting_wallet_topup_amount', None)
+    context.user_data.pop('awaiting_wallet_topup_receipt', None)
+
+    await query.edit_message_text(
+        f"لطفاً فیش پرداخت برای {order['label']} را ارسال کنید.\n\n"
+        "پس از تأیید ادمین، سرویس شما فعال یا تمدید خواهد شد.\n"
+        f"{payment_msg}",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ انصراف", callback_data=order['back_callback'])]
+        ])
+    )
+
+
+async def prompt_payment_method(query, context: ContextTypes.DEFAULT_TYPE, order):
+    """Ask the user to choose between wallet and direct payment."""
+    context.user_data['pending_order'] = order
+    await query.edit_message_text(
+        f"روش پرداخت برای {order['label']} را انتخاب کنید.\n\n"
+        f"مبلغ: {_format_wallet_amount(order['amount'])}",
+        reply_markup=get_payment_method_keyboard(order['back_callback'])
+    )
+
+
+def _clear_direct_payment_context(context: ContextTypes.DEFAULT_TYPE):
+    """Clear direct-payment flags after a receipt has been stored."""
+    for key in ('awaiting_direct_receipt', 'pending_order'):
+        context.user_data.pop(key, None)
 
 # Handler functions for various actions
 async def handle_check_status(query, user_id):
@@ -262,9 +515,16 @@ async def handle_buy_service(query, user_id):
     keyboard = get_vpn_plans_keyboard(policy) + get_back_to_main_button()
     reply_markup = InlineKeyboardMarkup(keyboard)
     max_config_gb = policy.get("max_config_gb", 0)
-    max_config_label = "نامحدود" if not max_config_gb else f"{int(max_config_gb) if float(max_config_gb).is_integer() else max_config_gb}GB"
+    if not max_config_gb:
+        max_config_label = "نامحدود"
+    else:
+        val = int(max_config_gb) if float(max_config_gb).is_integer() else max_config_gb
+        max_config_label = f"{val} گیگ"
 
-    await query.edit_message_text(f"لطفاً پلن مورد نظر خود را انتخاب کنید.\n هر کانفیگ حداکثر به مقدار {max_config_label} قابل شارژ است", reply_markup=reply_markup)
+    await query.edit_message_text(
+        f"لطفاً پلن مورد نظر خود را انتخاب کنید.\n هر کانفیگ حداکثر به مقدار {max_config_label} قابل شارژ است",
+        reply_markup=reply_markup,
+    )
 
 async def handle_buy_service_gift(query, user_id):
     """Handle the buy gift service option"""
@@ -286,13 +546,14 @@ async def handle_plan_selection(query, plan_data, user_id, context: ContextTypes
         reply_markup = InlineKeyboardMarkup(get_back_to_main_button())
         await query.edit_message_text("فروش فعال نیست.", reply_markup=reply_markup)
         return
-    plan = VPN_PLANS.get(plan_data)
+    policy = get_service_policy()
+    plan_key = plan_data[len("plan_"):]
+    plan = build_vpn_plans(policy).get(plan_key)
     if not plan:
         reply_markup = InlineKeyboardMarkup(get_back_to_main_button())
         await query.edit_message_text("پلن نامعتبر است.", reply_markup=reply_markup)
         return
 
-    policy = get_service_policy()
     if policy['max_config_gb'] > 0 and float(plan.get('gb', 0)) > policy['max_config_gb']:
         reply_markup = InlineKeyboardMarkup(get_back_to_main_button())
         await query.edit_message_text(
@@ -301,18 +562,8 @@ async def handle_plan_selection(query, plan_data, user_id, context: ContextTypes
         )
         return
 
-    context.user_data['selected_plan'] = plan
-    keyboard = get_back_to_main_button()
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await query.edit_message_text(
-        f"لطفاً فیش پرداخت برای پلن {plan['name']} را ارسال کنید.\n\n"
-        "در صورت وقوع شرایط خاص در کشور کانفیگ شما تمدید خواهد شد\n"
-        "پس از تأیید ادمین، کانفیگ برای شما ارسال خواهد شد.\n"
-        + payment_msg,
-        parse_mode="Markdown",
-        reply_markup=reply_markup
-    )
+    order = _build_order('service', plan['name'], plan['gb'], plan['price'], 'buy_service', plan_key=plan_key)
+    await prompt_payment_method(query, context, order)
 
 async def handle_free_trial(query, data, user_id, context: ContextTypes.DEFAULT_TYPE):
     """Handle the free trial option"""
@@ -378,73 +629,97 @@ async def handle_free_trial(query, data, user_id, context: ContextTypes.DEFAULT_
             reply_markup=reply_markup
         )
 
+
+async def handle_payment_method_choice(query, data, user_id, context: ContextTypes.DEFAULT_TYPE):
+    """Handle wallet or direct payment selection for a pending order."""
+    order = context.user_data.get('pending_order')
+    if not order:
+        await query.edit_message_text(
+            "اطلاعات پرداخت یافت نشد.",
+            reply_markup=InlineKeyboardMarkup(get_back_to_main_button())
+        )
+        return
+
+    if data == 'pay_wallet':
+        success = await _fulfill_order_with_wallet(query, user_id, context, order)
+        if success:
+            _clear_payment_context(context)
+        return
+
+    if data == 'pay_direct':
+        await prompt_direct_receipt(query, context, order)
+        return
+
+    await query.edit_message_text(
+        "روش پرداخت نامعتبر است.",
+        reply_markup=InlineKeyboardMarkup(get_back_to_main_button())
+    )
+
+
 async def handle_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle receipt photos sent by users"""
     keyboard = get_back_to_main_button()
-    if 'selected_plan' not in context.user_data:
-        await update.message.reply_text("لطفاً ابتدا یک پلن انتخاب کنید.", reply_markup=InlineKeyboardMarkup(keyboard))
-        return
 
     if not update.message.photo:
         await update.message.reply_text("لطفاً یک تصویر از فیش پرداخت ارسال کنید.")
         return
 
     photo = update.message.photo[-1]
-    plan = context.user_data['selected_plan']
     user_id = update.effective_user.id
+    if context.user_data.get('awaiting_wallet_topup_receipt'):
+        amount = context.user_data.get('wallet_topup_amount')
+        if amount is None:
+            await update.message.reply_text("ابتدا مبلغ شارژ را ارسال کنید.")
+            return
 
-    # Get additional info if this is an extension
-    is_extension = plan.get('is_extension', False)
-    extension_email = plan.get('email', None) if is_extension else None
+        order = _build_order('wallet_topup', f"شارژ کیف پول {amount:g}", 0, amount, 'wallet_menu')
+        payment_id = save_payment_request(
+            user_id,
+            order['label'],
+            photo.file_id,
+            payment_type='wallet_topup',
+            amount=amount,
+            plan_key='wallet_topup',
+            plan_gb=0,
+        )
+        await _send_payment_notification(context, payment_id, update.effective_user, order, photo.file_id, 'wallet_topup')
 
-    # Save payment request
-    payment_id = save_payment_request(user_id, plan['name'], photo.file_id)
+        await update.message.reply_text(
+            f"فیش شارژ کیف پول شما دریافت شد و در انتظار تأیید ادمین است.\n"
+            f"مبلغ درخواستی: {_format_wallet_amount(amount)}",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        _clear_payment_context(context)
+        return
 
-    # Notify admins
-    for admin_id in ADMIN_IDS:
-        try:
-            # Include extension info in the caption if applicable
-            extension_info = f"\nتمدید برای: {extension_email}" if is_extension else ""
+    if context.user_data.get('awaiting_direct_receipt') and context.user_data.get('pending_order'):
+        order = context.user_data['pending_order']
+        payment_type = 'extension' if order['kind'] == 'extension' else 'service'
+        payment_id = save_payment_request(
+            user_id,
+            order['label'],
+            photo.file_id,
+            payment_type=payment_type,
+            amount=order['amount'],
+            target_email=order.get('email'),
+            target_client_id=order.get('client_id'),
+            plan_key=order.get('plan_key'),
+            plan_gb=order.get('gb')
+        )
+        await _send_payment_notification(context, payment_id, update.effective_user, order, photo.file_id, payment_type)
 
-            await context.bot.send_photo(
-                chat_id=admin_id,
-                photo=photo.file_id,
-                caption=f"درخواست پرداخت جدید:\n"
-                        f"کاربر: {update.effective_user.full_name}\n"
-                        f"پلن: {plan['name']}{extension_info}\n"
-                        f"شناسه پرداخت: {payment_id}",
-                reply_markup=get_admin_approval_keyboard(payment_id)
-            )
-        except Exception as e:
-            logger.error(f"Error notifying admin {admin_id}: {e}")
+        await update.message.reply_text(
+            "فیش پرداخت شما دریافت شد و در انتظار تأیید ادمین است.\n"
+            "پس از تأیید، سرویس برای شما فعال یا تمدید خواهد شد.",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        _clear_direct_payment_context(context)
+        return
 
-    # Send confirmation message based on request type
-    if is_extension:
-        message = "فیش پرداخت شما برای تمدید سرویس دریافت شد و در انتظار تأیید ادمین است.\n" \
-                 "پس از تأیید، سرویس شما تمدید خواهد شد."
-    else:
-        message = "فیش پرداخت شما دریافت شد و در انتظار تأیید ادمین است.\n" \
-                 "پس از تأیید، کانفیگ برای شما ارسال خواهد شد."
-
-    await update.message.reply_text(message, reply_markup=InlineKeyboardMarkup(keyboard))
-
-    # Store extension details in the database or in a persistent context
-    if is_extension:
-        import json
-        if not hasattr(context.bot_data, 'extension_requests'):
-            context.bot_data['extension_requests'] = {}
-
-        # Store extension details with payment_id as key
-        context.bot_data['extension_requests'][str(payment_id)] = {
-            'email': extension_email,
-            'gb_amount': plan['gb'],
-            'client_id': context.user_data.get('extension_details', {}).get('client_id', '')
-        }
-
-    # Clean up user data
-    del context.user_data['selected_plan']
-    if 'extension_details' in context.user_data:
-        del context.user_data['extension_details']
+    await update.message.reply_text(
+        "لطفاً ابتدا از منوی خرید یا کیف پول یکی از گزینه‌ها را انتخاب کنید.",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
 # Admin handling functions
 async def handle_admin_extend_all(query, context, data):
@@ -504,6 +779,10 @@ async def handle_admin_callback(query, data, user_id, context: ContextTypes.DEFA
         await show_ticket_messages_admin(query, ticket_id)
     elif data == "admin_menu":
         await show_admin_menu(query)
+    elif data == "admin_plans":
+        await show_admin_plans(query)
+    elif data.startswith("admin_plan_"):
+        await handle_admin_plan_callback(query, data, context)
     # Client management callbacks
     elif data.startswith("admin_clients_page_"):
         page = int(data.split("_")[-1])
@@ -528,6 +807,76 @@ async def show_admin_menu(query):
         "🔐 پنل مدیریت\n\nلطفا یک گزینه را انتخاب کنید:",
         reply_markup=get_admin_menu_keyboard()
     )
+
+
+async def show_admin_plans(query):
+    """Show list of VPN plans for admin management"""
+    plans = get_vpn_plans(include_inactive=True)
+    if not plans:
+        await query.edit_message_text(
+            "هیچ پلنی تعریف نشده است.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ افزودن پلن جدید", callback_data="admin_plan_add")],
+                [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_menu")]
+            ])
+        )
+        return
+
+    keyboard = []
+    for p in plans:
+        key = p['plan_key']
+        label = f"{p['name']} | {p['gb']:g} گیگ | {_format_price_toman(p.get('price',0))}"
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"admin_plan_edit_{key}")])
+        keyboard.append([InlineKeyboardButton("حذف", callback_data=f"admin_plan_delete_{key}")])
+
+    keyboard.append([InlineKeyboardButton("➕ افزودن پلن جدید", callback_data="admin_plan_add")])
+    keyboard.append([InlineKeyboardButton("🔙 بازگشت", callback_data="admin_menu")])
+
+    await query.edit_message_text("مدیریت پلن‌ها:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def handle_admin_plan_callback(query, data, context: ContextTypes.DEFAULT_TYPE):
+    if query.from_user.id not in ADMIN_IDS:
+        await query.answer("دسترسی رد شد.")
+        return
+
+    if data == "admin_plan_add":
+        # Prompt admin to send plan in format: name|gb|price
+        context.user_data['awaiting_plan_create'] = True
+        await query.edit_message_text(
+            "برای افزودن پلن، نام|گیگ|قیمت را ارسال کنید (مثال: '10GB|10|5').\n\nبرای لغو، /admin را بزنید.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_menu")]])
+        )
+        return
+
+    if data.startswith("admin_plan_delete_"):
+        plan_key = data.replace("admin_plan_delete_", "")
+        deleted = delete_vpn_plan(plan_key)
+        if deleted:
+            await query.edit_message_text(f"پلن {plan_key} حذف شد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_plans")]]))
+        else:
+            await query.edit_message_text(f"پلن {plan_key} یافت نشد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_plans")]]))
+        return
+
+    if data.startswith("admin_plan_edit_"):
+        plan_key = data.replace("admin_plan_edit_", "")
+        plan = None
+        for p in get_vpn_plans(include_inactive=True):
+            if p['plan_key'] == plan_key:
+                plan = p
+                break
+
+        if not plan:
+            await query.edit_message_text("پلن یافت نشد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_plans")]]))
+            return
+
+        # Prompt admin to send new values in format: name|gb|price
+        context.user_data['awaiting_plan_edit'] = plan_key
+        await query.edit_message_text(
+            f"در حال ویرایش پلن {plan_key}. لطفاً مقدار جدید را در فرمت نام|گیگ|قیمت ارسال کنید.\n\nمثال: 'Premium 10GB|10|12'",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_plans")]])
+        )
+        return
 
 
 async def show_service_policy(query):
@@ -627,15 +976,18 @@ async def show_pending_approvals(query, context: ContextTypes.DEFAULT_TYPE = Non
         return
 
     # Store receipt file IDs in context.user_data if context is provided
-    if context and not hasattr(context.bot_data, 'receipt_file_ids'):
+    if context and 'receipt_file_ids' not in context.bot_data:
         context.bot_data['receipt_file_ids'] = {}
 
     message = "درخواست‌های در انتظار تأیید:\n\n"
     keyboard = []
 
     for payment in pending_payments:
-        payment_id, user_id, plan, first_name, username, receipt_file_id = payment
+        payment_id, user_id, plan, first_name, username, receipt_file_id, payment_type, amount, plan_key, plan_gb = payment
         user_display = f"{first_name} (@{username})" if username else f"{first_name} (بدون یوزرنیم)"
+        payment_type_label = "شارژ کیف پول" if payment_type == 'wallet_topup' else "خرید سرویس"
+        amount_text = _format_wallet_amount(amount)
+        gb_text = _format_wallet_amount(plan_gb)
 
         # Store the file_id in context for later retrieval if context is provided
         if context:
@@ -644,7 +996,10 @@ async def show_pending_approvals(query, context: ContextTypes.DEFAULT_TYPE = Non
         message += (
             f"🆔 {payment_id}\n"
             f"👤 کاربر: {user_display}\n"
-            f"📝 پلن: {plan}\n\n"
+            f"📝 نوع: {payment_type_label}\n"
+            f"📦 مورد: {plan}\n"
+            f"📊 حجم: {gb_text} گیگ\n"
+            f"💰 مبلغ: {_format_price_toman(amount)}\n\n"
         )
 
         # Add approval/rejection buttons
@@ -867,6 +1222,24 @@ async def handle_support_message(update: Update, context: ContextTypes.DEFAULT_T
     user_id = update.effective_user.id
     message_text = update.message.text
 
+    if context.user_data.get('awaiting_wallet_topup_amount'):
+        try:
+            wallet_amount = float(message_text.strip())
+            if wallet_amount <= 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("مبلغ نامعتبر است. لطفاً یک عدد بزرگتر از صفر ارسال کنید.")
+            return
+
+        context.user_data['wallet_topup_amount'] = wallet_amount
+        context.user_data['awaiting_wallet_topup_amount'] = False
+        context.user_data['awaiting_wallet_topup_receipt'] = True
+        await update.message.reply_text(
+            f"مبلغ {_format_wallet_amount(wallet_amount)} ثبت شد.\n"
+            "اکنون فیش پرداخت را ارسال کنید."
+        )
+        return
+
     if user_id in ADMIN_IDS and context.user_data.get("awaiting_service_policy_max_gb"):
         try:
             max_config_gb = float(message_text.strip())
@@ -881,6 +1254,47 @@ async def handle_support_message(update: Update, context: ContextTypes.DEFAULT_T
         update_app_settings(max_config_gb=max_config_gb)
         del context.user_data["awaiting_service_policy_max_gb"]
         await update.message.reply_text("حداکثر حجم هر کانفیگ با موفقیت به‌روزرسانی شد.")
+        return
+
+    # Admin plan create flow: expecting 'name|gb|price'
+    if user_id in ADMIN_IDS and context.user_data.get('awaiting_plan_create'):
+        text = message_text.strip()
+        parts = [p.strip() for p in text.split('|')]
+        if len(parts) < 3:
+            await update.message.reply_text("فرمت نامعتبر. لطفاً به صورت نام|گیگ|قیمت ارسال کنید.")
+            return
+        name, gb_raw, price_raw = parts[0], parts[1], parts[2]
+        try:
+            gb = float(gb_raw)
+            price = float(price_raw)
+        except ValueError:
+            await update.message.reply_text("مقادیر گیگ و قیمت باید عددی باشند.")
+            return
+
+        plan_key = save_vpn_plan(name, gb, price)
+        del context.user_data['awaiting_plan_create']
+        await update.message.reply_text(f"پلن {plan_key} با موفقیت ایجاد شد.")
+        return
+
+    # Admin plan edit flow: awaiting_plan_edit contains plan_key
+    if user_id in ADMIN_IDS and context.user_data.get('awaiting_plan_edit'):
+        plan_key = context.user_data.get('awaiting_plan_edit')
+        text = message_text.strip()
+        parts = [p.strip() for p in text.split('|')]
+        if len(parts) < 3:
+            await update.message.reply_text("فرمت نامعتبر. لطفاً به صورت نام|گیگ|قیمت ارسال کنید.")
+            return
+        name, gb_raw, price_raw = parts[0], parts[1], parts[2]
+        try:
+            gb = float(gb_raw)
+            price = float(price_raw)
+        except ValueError:
+            await update.message.reply_text("مقادیر گیگ و قیمت باید عددی باشند.")
+            return
+
+        save_vpn_plan(name, gb, price, plan_key=plan_key)
+        del context.user_data['awaiting_plan_edit']
+        await update.message.reply_text(f"پلن {plan_key} با موفقیت به‌روزرسانی شد.")
         return
 
     if user_id in ADMIN_IDS and context.user_data.get("awaiting_service_policy_expiry_date"):
@@ -1137,38 +1551,57 @@ async def handle_admin_decision(query, data, user_id, context: ContextTypes.DEFA
 
 async def approve_payment(query, payment_id, context: ContextTypes.DEFAULT_TYPE):
     """Approve a payment and create VPN configuration for the user or extend existing one"""
-    # Get payment info including user_id, plan details and username
-    payment_info = get_payment_info(payment_id)
+    payment_record = get_payment_record(payment_id)
 
-    if not payment_info:
+    if not payment_record or payment_record['status'] != 'pending':
         await query.answer("پرداخت یافت نشد یا قبلاً پردازش ��ده است.")
         return
 
-    user_id, plan_name, username = payment_info
-    plan_gb = _parse_plan_gb(plan_name)
+    user_id = payment_record['user_id']
+    plan_name = payment_record['plan']
+    username = payment_record['username']
+    payment_type = payment_record['payment_type'] or 'service'
+    payment_amount = float(payment_record['amount'] or 0)
+    plan_gb = float(payment_record['plan_gb'] or 0)
+    if plan_gb <= 0:
+        plan_gb = _parse_plan_gb(plan_name)
     policy = get_service_policy()
 
-    # Check if this is an extension request
-    is_extension = False
-    extension_email = None
-    extension_client_id = None
+    if payment_type == 'wallet_topup':
+        success, new_balance = adjust_wallet_balance(user_id, payment_amount)
+        if not success:
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text=f"خطا در شارژ کیف پول کاربر {user_id}",
+                reply_markup=get_admin_menu_keyboard(),
+            )
+            return
 
-    if 'extension_requests' in context.bot_data and str(payment_id) in context.bot_data['extension_requests']:
-        is_extension = True
-        extension_data = context.bot_data['extension_requests'][str(payment_id)]
-        extension_email = extension_data.get('email')
-        extension_client_id = extension_data.get('client_id')
-    elif "تمدید" in query.message.caption:
-        update_payment_status(payment_id, 'rejected')
+        update_payment_status(payment_id, 'approved')
         await context.bot.send_message(
             chat_id=user_id,
-            text=f"مشکلی پیش آمد مجدد برای تمدید را درخواست کنید!\n\n",
-            parse_mode="Markdown",
+            text=(
+                f"✅ کیف پول شما شارژ شد.\n\n"
+                f"مبلغ شارژ: {_format_wallet_amount(payment_amount)}\n"
+                f"موجودی جدید: {_format_wallet_amount(new_balance)}"
+            ),
             reply_markup=InlineKeyboardMarkup(get_back_to_main_button())
         )
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=f"کیف پول کاربر {user_id} با موفقیت شارژ شد.",
+        )
         return
+
+    is_extension = payment_type == 'extension'
+    extension_email = payment_record['target_email']
+    extension_client_id = payment_record['target_client_id']
+
     try:
-        if is_extension and extension_email and extension_client_id:
+        if is_extension and (not extension_email or not extension_client_id):
+            raise Exception("اطلاعات سرویس برای تمدید ناقص است")
+
+        if is_extension:
             # Handle extension of existing service
 
             # Get current status to obtain expiry date
@@ -1206,9 +1639,6 @@ async def approve_payment(query, payment_id, context: ContextTypes.DEFAULT_TYPE)
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(get_back_to_main_button())
             )
-
-            # Clean up extension request data
-            del context.bot_data['extension_requests'][str(payment_id)]
 
             # Confirm successful approval to admin
             await context.bot.send_message(
@@ -1279,22 +1709,19 @@ async def reject_payment(query, payment_id, context: ContextTypes.DEFAULT_TYPE):
     """Reject a payment and notify the user"""
     try:
         # Get user ID and plan information associated with the payment
-        payment_info = get_payment_info(payment_id)
+        payment_record = get_payment_record(payment_id)
 
-        if not payment_info:
+        if not payment_record or payment_record['status'] != 'pending':
             await query.answer("پرداخت یافت نشد یا قبلاً پردازش شده است.")
             return
 
-        user_id, plan_name, username = payment_info
-
-        # Check if this is an extension request
-        is_extension = False
-        extension_email = None
-
-        if hasattr(context.bot_data, 'extension_requests') and str(payment_id) in context.bot_data['extension_requests']:
-            is_extension = True
-            extension_data = context.bot_data['extension_requests'][str(payment_id)]
-            extension_email = extension_data.get('email')
+        user_id = payment_record['user_id']
+        plan_name = payment_record['plan']
+        payment_type = payment_record['payment_type'] or 'service'
+        amount = float(payment_record['amount'] or 0)
+        is_extension = payment_type == 'extension'
+        is_wallet_topup = payment_type == 'wallet_topup'
+        extension_email = payment_record['target_email']
 
         # Update payment status to rejected
         update_payment_status(payment_id, 'rejected')
@@ -1302,7 +1729,12 @@ async def reject_payment(query, payment_id, context: ContextTypes.DEFAULT_TYPE):
         # Notify user about the rejection with details
         try:
             # Customize message based on request type
-            if is_extension:
+            if is_wallet_topup:
+                message = (f"❌ فیش پرداخت شما برای شارژ کیف پول رد شد.\n\n"
+                         f"مبلغ: {_format_wallet_amount(amount)}\n"
+                         f"شناسه پرداخت: {payment_id}\n"
+                         f"اگر فکر می‌کنید این اشتباه است، لطفاً با ایجاد یک تیکت پشتیبانی با ما تماس بگیرید.")
+            elif is_extension:
                 message = (f"❌ فیش پرداخت شما برای تمدید سرویس {plan_name} رد شد.\n\n"
                          f"سرویس: {extension_email}\n"
                          f"شناسه پرداخت: {payment_id}\n"
@@ -1330,11 +1762,6 @@ async def reject_payment(query, payment_id, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=query.message.chat_id,
                 text=f"پرداخت {payment_id} رد شد و کاربر با موفقیت مطلع شد."
             )
-
-            # Clean up extension request data if it exists
-            if is_extension and hasattr(context.bot_data, 'extension_requests'):
-                if str(payment_id) in context.bot_data['extension_requests']:
-                    del context.bot_data['extension_requests'][str(payment_id)]
 
         except Exception as e:
             logger.error(f"Error notifying user {user_id} about rejected payment: {e}")
@@ -1443,9 +1870,14 @@ async def show_extend_options(query, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_extend_selection(query, data, user_id, context: ContextTypes.DEFAULT_TYPE):
     """Handle the selection of an extension amount"""
-    # Extract GB amount from callback data
-    gb_amount = int(data.split('_')[2])
     policy = get_service_policy()
+    plan_key = data[len("extend_plan_"):]
+    selected_plan = build_vpn_plans(policy).get(plan_key)
+    if not selected_plan:
+        await query.edit_message_text("پلن نامعتبر است.", reply_markup=InlineKeyboardMarkup(get_back_to_main_button()))
+        return
+
+    gb_amount = float(selected_plan.get('gb', 0))
 
     if policy['max_config_gb'] > 0:
         current_total_gb = None
@@ -1477,32 +1909,8 @@ async def handle_extend_selection(query, data, user_id, context: ContextTypes.DE
         await query.edit_message_text("خطا در بازیابی اطلاعات کانفیگ.", reply_markup=InlineKeyboardMarkup(get_back_to_main_button()))
         return
 
-    # Store extension details in context for later use
-    context.user_data['extension_details'] = {
-        'email': email,
-        'gb_amount': gb_amount,
-        'client_id': client_id,
-        'type': 'extension'  # Mark this as an extension request
-    }
-
-    # Create a "plan" object similar to what's used for new service purchases
-    context.user_data['selected_plan'] = {
-        'name': f"تمدید {gb_amount}GB",
-        'gb': gb_amount,
-        'is_extension': True,
-        'email': email  # Store email to identify which config to extend
-    }
-
-    keyboard = get_back_to_main_button()
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await query.edit_message_text(
-        f"لطفاً فیش پرداخت برای تمدید سرویس با {gb_amount} گیگابایت را ارسال کنید.\n\n"
-        f"پس از تأیید ادمین، تمدید برای شما اعمال خواهد شد.\n"
-        + payment_msg,
-        parse_mode="Markdown",
-        reply_markup=reply_markup
-    )
+    order = _build_order('extension', f"تمدید {gb_amount:g}GB", gb_amount, selected_plan['price'], f"status_{email}", email=email, client_id=client_id, plan_key=plan_key)
+    await prompt_payment_method(query, context, order)
 
     # Log the extension request
     logger.info(f"User {user_id} requested extension for {email} by {gb_amount}GB")
@@ -1510,6 +1918,7 @@ async def handle_extend_selection(query, data, user_id, context: ContextTypes.DE
 async def set_bot_commands(application):
     await application.bot.set_my_commands([
         ("start", "شروع کار با ربات"),
+        ("wallet", "مشاهده کیف پول"),
         ("support", "پشتیبانی"),
         ("admin", "پنل مدیریت (برای ادمین)")
     ])
@@ -1530,6 +1939,7 @@ def main():
 
     # Add handlers
     application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("wallet", wallet_command))
     application.add_handler(CommandHandler("admin", admin_command))
     application.add_handler(CommandHandler("broadcast", broadcast_command))
     application.add_handler(CommandHandler("support", support_command))
