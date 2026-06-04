@@ -49,6 +49,8 @@ def init_db():
         first_name TEXT,
         last_name TEXT,
         wallet_balance REAL DEFAULT 0,
+        referrer_user_id INTEGER,
+        referral_bonus_paid INTEGER DEFAULT 0,
         join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     ''')
@@ -58,6 +60,12 @@ def init_db():
     if 'wallet_balance' not in user_columns:
         logger.info("Adding wallet_balance column to users table")
         cursor.execute('ALTER TABLE users ADD COLUMN wallet_balance REAL DEFAULT 0')
+    if 'referrer_user_id' not in user_columns:
+        logger.info("Adding referrer_user_id column to users table")
+        cursor.execute('ALTER TABLE users ADD COLUMN referrer_user_id INTEGER')
+    if 'referral_bonus_paid' not in user_columns:
+        logger.info("Adding referral_bonus_paid column to users table")
+        cursor.execute('ALTER TABLE users ADD COLUMN referral_bonus_paid INTEGER DEFAULT 0')
 
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS web_accounts (
@@ -224,23 +232,89 @@ def init_db():
     conn.commit()
     conn.close()
 
-def get_or_create_user(user_id, username, first_name, last_name):
+def get_or_create_user(user_id, username, first_name, last_name, referrer_user_id=None):
     """Get or create a user record"""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
 
     cursor.execute('''
-    INSERT INTO users (user_id, username, first_name, last_name)
-    VALUES (?, ?, ?, ?)
+    INSERT INTO users (user_id, username, first_name, last_name, referrer_user_id)
+    VALUES (?, ?, ?, ?, ?)
     ON CONFLICT(user_id) DO UPDATE SET
         username = COALESCE(excluded.username, users.username),
         first_name = COALESCE(excluded.first_name, users.first_name),
-        last_name = COALESCE(excluded.last_name, users.last_name)
-    ''', (user_id, username, first_name, last_name))
+        last_name = COALESCE(excluded.last_name, users.last_name),
+        referrer_user_id = COALESCE(users.referrer_user_id, excluded.referrer_user_id)
+    ''', (user_id, username, first_name, last_name, referrer_user_id))
 
     conn.commit()
     conn.close()
     return user_id
+
+
+def get_user_referral_state(user_id):
+    """Return the referrer and whether the referral bonus has already been paid."""
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    cursor.execute(
+        'SELECT user_id, referrer_user_id, COALESCE(referral_bonus_paid, 0) AS referral_bonus_paid FROM users WHERE user_id = ?',
+        (user_id,)
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def credit_referral_bonus_if_first_service_purchase(user_id, purchase_amount, commission_percent=None):
+    """Credit the referring user once, on the first approved service purchase."""
+    if purchase_amount is None:
+        return False, None, 0.0
+
+    amount = float(purchase_amount)
+    if amount <= 0:
+        return False, None, 0.0
+
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    try:
+        conn.execute('BEGIN')
+        cursor.execute(
+            'SELECT referrer_user_id, COALESCE(referral_bonus_paid, 0) AS referral_bonus_paid FROM users WHERE user_id = ?',
+            (user_id,)
+        )
+        row = cursor.fetchone()
+        if not row or not row['referrer_user_id'] or row['referral_bonus_paid']:
+            conn.rollback()
+            return False, None, 0.0
+
+        if commission_percent is None:
+            commission_percent = float(get_service_policy().get('referral_commission_percent', 20))
+        commission_amount = round(amount * float(commission_percent) / 100.0, 2)
+
+        if commission_amount <= 0:
+            conn.rollback()
+            return False, row['referrer_user_id'], 0.0
+
+        cursor.execute(
+            'UPDATE users SET wallet_balance = COALESCE(wallet_balance, 0) + ? WHERE user_id = ?',
+            (commission_amount, row['referrer_user_id'])
+        )
+        cursor.execute(
+            'UPDATE users SET referral_bonus_paid = 1 WHERE user_id = ?',
+            (user_id,)
+        )
+        conn.commit()
+        return True, row['referrer_user_id'], commission_amount
+    except Exception:
+        conn.rollback()
+        logger.exception('Failed to credit referral bonus for user %s', user_id)
+        return False, None, 0.0
+    finally:
+        conn.close()
 
 
 def get_wallet_balance(user_id):
@@ -324,10 +398,11 @@ def get_app_settings():
     return {
         'max_config_gb': settings.get('max_config_gb', '0') or '0',
         'global_expiry_date': settings.get('global_expiry_date', default_expiry_date) or default_expiry_date,
+        'referral_commission_percent': settings.get('referral_commission_percent', '20') or '20',
     }
 
 
-def update_app_settings(max_config_gb=None, global_expiry_date=None):
+def update_app_settings(max_config_gb=None, global_expiry_date=None, referral_commission_percent=None):
     """Update application-wide service policy settings."""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
@@ -352,6 +427,16 @@ def update_app_settings(max_config_gb=None, global_expiry_date=None):
             (global_expiry_date,)
         )
 
+    if referral_commission_percent is not None:
+        cursor.execute(
+            '''
+            INSERT INTO app_settings (setting_key, setting_value)
+            VALUES ('referral_commission_percent', ?)
+            ON CONFLICT(setting_key) DO UPDATE SET setting_value = excluded.setting_value
+            ''',
+            (str(referral_commission_percent),)
+        )
+
     conn.commit()
     conn.close()
 
@@ -370,6 +455,7 @@ def get_service_policy():
         'max_config_gb': max_config_gb,
         'global_expiry_date': expiry_date.strftime('%Y-%m-%d'),
         'global_expiry_time_ms': expiry_time_ms,
+        'referral_commission_percent': float(settings.get('referral_commission_percent', '20') or 20),
     }
 
 

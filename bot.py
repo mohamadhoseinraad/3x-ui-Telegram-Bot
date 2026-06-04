@@ -23,7 +23,7 @@ from telegram import MenuButtonCommands
 
 from client_management import show_all_clients, confirm_delete_client, delete_client_handler, cancel_delete_client
 # Import our modules
-from config import BOT_TOKEN, ADMIN_IDS, IPDOMAIN, PORT, HOST, SNI, DB_FILE, ALLOW_BUY, payment_msg
+from config import BOT_TOKEN, ADMIN_IDS, BOT_ID, IPDOMAIN, PORT, HOST, SNI, DB_FILE, ALLOW_BUY, payment_msg
 from database import (
     init_db, get_or_create_user, get_user_configs, save_new_config,
     update_config_active_status, get_client_id_by_email, check_trial_usage,
@@ -31,7 +31,8 @@ from database import (
     create_ticket, add_ticket_message, close_ticket, update_ticket_status, verify_ticket_access,
     get_formatted_user_tickets, get_ticket_conversation, get_payment_record, update_payment_status,
     get_pending_payments, update_config_total_gb, get_all_configs_with_users,
-    get_service_policy, update_app_settings
+    get_service_policy, update_app_settings,
+    get_user_referral_state, credit_referral_bonus_if_first_service_purchase,
 )
 from database import get_vpn_plans, save_vpn_plan, delete_vpn_plan
 from menus import (
@@ -115,6 +116,33 @@ def _format_price_toman(amount):
     else:
         s = f"{n:,.2f}".rstrip('0').rstrip('.')
     return f"{s} تومن"
+
+
+def _build_referral_link(user_id, bot_username=None):
+    bot_username = (bot_username or BOT_ID or "").lstrip("@")
+    if bot_username:
+        return f"https://t.me/{bot_username}?start=ref_{user_id}"
+    return "لینک دعوت در دسترس نیست؛ نام ربات تنظیم نشده است."
+
+
+def _parse_referrer_arg(args):
+    if not args:
+        return None
+
+    raw_value = args[0].strip()
+    if not raw_value:
+        return None
+
+    if raw_value.startswith("ref_"):
+        raw_value = raw_value[4:]
+    elif raw_value.startswith("ref="):
+        raw_value = raw_value[4:]
+
+    if not raw_value.isdigit():
+        return None
+
+    referrer_user_id = int(raw_value)
+    return referrer_user_id if referrer_user_id > 0 else None
 
 
 def _build_order(kind, label, gb, amount, back_callback, email=None, client_id=None, plan_key=None):
@@ -245,6 +273,7 @@ async def _fulfill_order_with_wallet(query, user_id, context, order):
                 raise Exception(f"خطا در ایجاد کانفیگ: {error}")
 
             save_new_config(user_id, email, client_id, plan_gb)
+            referral_applied, referrer_user_id, commission_amount = credit_referral_bonus_if_first_service_purchase(user_id, cost)
             adjust_wallet_balance(user_id, -cost)
             vless_link = generate_vless_link(client_id, email)
 
@@ -256,6 +285,17 @@ async def _fulfill_order_with_wallet(query, user_id, context, order):
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(get_back_to_main_button())
             )
+            if referral_applied and referrer_user_id:
+                try:
+                    await context.bot.send_message(
+                        chat_id=referrer_user_id,
+                        text=(
+                            f"🎉 یک عضو جدید با دعوت شما اولین خرید خود را انجام داد.\n"
+                            f"{_format_price_toman(commission_amount)} به کیف پول شما اضافه شد."
+                        )
+                    )
+                except Exception:
+                    logger.exception("Failed to notify referrer %s", referrer_user_id)
             return True
     except Exception as exc:
         logger.error(f"Wallet payment error: {exc}")
@@ -271,13 +311,35 @@ async def _fulfill_order_with_wallet(query, user_id, context, order):
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle the /start command"""
     user = update.effective_user
+    referrer_user_id = _parse_referrer_arg(context.args)
+    if referrer_user_id == user.id:
+        referrer_user_id = None
+
+    get_or_create_user(user.id, user.username, user.first_name, user.last_name, referrer_user_id=referrer_user_id)
+
+    welcome_message = (
+        "گزینه مورد نظر را انتخاب کنید\n"
+        "این سرویس به تازگی راه اندازی شده است و درحال حاضر صرفا جهت تست قرار داده شده.\n"
+        "امیدوارم کیفیت لطفا نظرات خود را با ما در میان بگذارید."
+    )
+    if referrer_user_id:
+        welcome_message += "\n\nدعوت شما ثبت شد و در اولین خرید این کاربر، پورسانت به کیف پول شما اضافه می‌شود."
+
+    await update.message.reply_text(welcome_message, reply_markup=get_main_menu_keyboard())
+
+
+async def referral_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show the user's referral link and commission info."""
+    user = update.effective_user
     get_or_create_user(user.id, user.username, user.first_name, user.last_name)
+    policy = get_service_policy()
+    referral_percent = policy.get("referral_commission_percent", 20)
+    referral_link = _build_referral_link(user.id, getattr(context.bot, "username", None))
 
     await update.message.reply_text(
-        "گزینه مورد نظر را انتخاب کنید\n "
-        "این سرویس به تازگی راه اندازی شده است و درحال حاضر صرفا جهت تست قرار داده شده . "
-        "امیدوارم کیفیت لطفا نظرات خود را با ما در میان بگذارید.",
-        reply_markup=get_main_menu_keyboard()
+        f"لینک دعوت شما:\n{referral_link}\n\n"
+        f"پورسانت فعلی برای اولین خرید هر عضو جدید: {referral_percent:g}%",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("بازگشت", callback_data="back_to_main")]])
     )
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -363,6 +425,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_buy_service_gift(query, user_id)
     elif data == "wallet_menu":
         await show_wallet_menu(query, user_id)
+    elif data == "referral_info":
+        await show_referral_info(query, user_id, context)
     elif data == "wallet_topup":
         await prompt_wallet_topup_amount(query, context)
     elif data in ("pay_wallet", "pay_direct"):
@@ -417,6 +481,19 @@ async def show_wallet_menu(query, user_id):
         f"💰 موجودی کیف پول شما: {_format_wallet_amount(balance)}\n\n"
         "از این بخش می‌توانید کیف پول خود را شارژ کنید.",
         reply_markup=get_wallet_keyboard()
+    )
+
+
+async def show_referral_info(query, user_id, context: ContextTypes.DEFAULT_TYPE):
+    """Show the user's referral link and current commission rate."""
+    policy = get_service_policy()
+    referral_percent = policy.get("referral_commission_percent", 20)
+    referral_link = _build_referral_link(user_id, getattr(context.bot, "username", None))
+
+    await query.edit_message_text(
+        f"لینک دعوت شما:\n{referral_link}\n\n"
+        f"برای اولین خرید هر عضو جدید، {referral_percent:g}% از مبلغ خرید به کیف پول شما افزوده می‌شود.",
+        reply_markup=InlineKeyboardMarkup(get_back_to_main_button())
     )
 
 
@@ -774,6 +851,8 @@ async def handle_admin_callback(query, data, user_id, context: ContextTypes.DEFA
         await prompt_service_policy_max_gb(query, context)
     elif data == "admin_service_policy_set_expiry_date":
         await prompt_service_policy_expiry_date(query, context)
+    elif data == "admin_service_policy_set_referral_percent":
+        await prompt_service_policy_referral_percent(query, context)
     elif data.startswith("admin_view_ticket_"):
         ticket_id = int(data.split("_")[3])
         await show_ticket_messages_admin(query, ticket_id)
@@ -883,13 +962,15 @@ async def show_service_policy(query):
     """Show the current service policy values."""
     policy = get_service_policy()
     max_config_gb = policy.get("max_config_gb", 0)
-    max_config_text = "نامحدود" if not max_config_gb else f"{max_config_gb:g} GB"
+    max_config_text = "نامحدود" if not max_config_gb else f"{max_config_gb:g} گیگ"
+    referral_percent = policy.get("referral_commission_percent", 20)
 
     message = (
-        "📜 Service Policy\n\n"
+        "📜 تنظیمات سرویس\n\n"
         f"حداکثر حجم هر کانفیگ: {max_config_text}\n"
         f"تاریخ انقضای سراسری: {policy.get('global_expiry_date', 'نامشخص')}\n"
         f"زمان انقضای ذخیره‌شده: {policy.get('global_expiry_time_ms', 'نامشخص')}\n"
+        f"پورسانت دعوت: {referral_percent:g}%\n"
     )
 
     await query.edit_message_text(
@@ -897,6 +978,7 @@ async def show_service_policy(query):
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("✏️ تغییر حداکثر حجم هر کانفیگ", callback_data="admin_service_policy_set_max_gb")],
             [InlineKeyboardButton("📅 تغییر تاریخ انقضای سراسری", callback_data="admin_service_policy_set_expiry_date")],
+            [InlineKeyboardButton("🤝 تغییر پورسانت دعوت", callback_data="admin_service_policy_set_referral_percent")],
             [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_menu")]
         ])
     )
@@ -930,6 +1012,24 @@ async def prompt_service_policy_expiry_date(query, context: ContextTypes.DEFAULT
     await query.edit_message_text(
         f"تاریخ انقضای فعلی: {policy.get('global_expiry_date', 'نامشخص')}\n\n"
         "تاریخ جدید را با فرمت YYYY-MM-DD ارسال کنید.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ انصراف", callback_data="admin_service_policy")]
+        ])
+    )
+
+
+async def prompt_service_policy_referral_percent(query, context: ContextTypes.DEFAULT_TYPE):
+    """Ask the admin for a new referral commission percent."""
+    policy = get_service_policy()
+    context.user_data["awaiting_service_policy_referral_percent"] = True
+    context.user_data.pop("awaiting_service_policy_max_gb", None)
+    context.user_data.pop("awaiting_service_policy_expiry_date", None)
+
+    referral_percent = policy.get("referral_commission_percent", 20)
+
+    await query.edit_message_text(
+        f"پورسانت فعلی دعوت: {referral_percent:g}%\n\n"
+        "درصد جدید را ارسال کنید. مقدار باید بین 0 تا 100 باشد.",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("❌ انصراف", callback_data="admin_service_policy")]
         ])
@@ -1311,6 +1411,22 @@ async def handle_support_message(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("تاریخ انقضای سراسری با موفقیت به‌روزرسانی شد.")
         return
 
+    if user_id in ADMIN_IDS and context.user_data.get("awaiting_service_policy_referral_percent"):
+        try:
+            referral_percent = float(message_text.strip())
+            if referral_percent < 0 or referral_percent > 100:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text(
+                "درصد نامعتبر است. لطفاً یک عدد بین 0 تا 100 ارسال کنید."
+            )
+            return
+
+        update_app_settings(referral_commission_percent=referral_percent)
+        del context.user_data["awaiting_service_policy_referral_percent"]
+        await update.message.reply_text("پورسانت دعوت با موفقیت به‌روزرسانی شد.")
+        return
+
     # Check if admin is sending a broadcast message
     if user_id in ADMIN_IDS and context.user_data.get('awaiting_broadcast'):
         del context.user_data['awaiting_broadcast']
@@ -1674,6 +1790,7 @@ async def approve_payment(query, payment_id, context: ContextTypes.DEFAULT_TYPE)
 
             # Save the new configuration in the database
             save_new_config(user_id, email, client_id, plan_gb)
+            referral_applied, referrer_user_id, commission_amount = credit_referral_bonus_if_first_service_purchase(user_id, payment_amount)
 
             # Update payment status to approved
             update_payment_status(payment_id, 'approved')
@@ -1689,6 +1806,18 @@ async def approve_payment(query, payment_id, context: ContextTypes.DEFAULT_TYPE)
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(get_back_to_main_button())
             )
+
+            if referral_applied and referrer_user_id:
+                try:
+                    await context.bot.send_message(
+                        chat_id=referrer_user_id,
+                        text=(
+                            f"🎉 دعوت شما باعث اولین خرید یک عضو جدید شد.\n"
+                            f"{_format_price_toman(commission_amount)} به کیف پول شما اضافه شد."
+                        )
+                    )
+                except Exception:
+                    logger.exception("Failed to notify referrer %s", referrer_user_id)
 
             # Confirm successful approval to admin
             await context.bot.send_message(
@@ -1918,6 +2047,7 @@ async def handle_extend_selection(query, data, user_id, context: ContextTypes.DE
 async def set_bot_commands(application):
     await application.bot.set_my_commands([
         ("start", "شروع کار با ربات"),
+        ("referral", "لینک دعوت و پورسانت"),
         ("wallet", "مشاهده کیف پول"),
         ("support", "پشتیبانی"),
         ("admin", "پنل مدیریت (برای ادمین)")
@@ -1927,6 +2057,11 @@ async def set_chat_menu_button(application):
     await application.bot.set_chat_menu_button(
         menu_button=MenuButtonCommands()
     )
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Log uncaught bot errors with update context."""
+    logger.exception("Unhandled bot error", exc_info=context.error)
 
 def main():
     """Main function to start the bot"""
@@ -1939,6 +2074,7 @@ def main():
 
     # Add handlers
     application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("referral", referral_command))
     application.add_handler(CommandHandler("wallet", wallet_command))
     application.add_handler(CommandHandler("admin", admin_command))
     application.add_handler(CommandHandler("broadcast", broadcast_command))
@@ -1949,6 +2085,7 @@ def main():
     application.add_handler(MessageHandler(filters.PHOTO, handle_receipt))
     # Add handler for text messages to process support tickets
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_support_message))
+    application.add_error_handler(error_handler)
 
     # Start the notification service
     logger.info("Starting notification service...")

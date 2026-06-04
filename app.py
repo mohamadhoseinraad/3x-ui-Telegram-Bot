@@ -54,6 +54,7 @@ from database import (
     update_web_account_login,
     verify_ticket_access,
     get_wallet_balance,
+    credit_referral_bonus_if_first_service_purchase,
 )
 from db_utils import delete_config_by_client_id, get_all_db_configs
 from menus import VPN_PLANS, build_vpn_plans
@@ -811,8 +812,15 @@ def approve_payment_web(payment_id):
                 raise RuntimeError(error)
 
             save_new_config(user_id, email, client_id, plan_gb)
+            referral_applied, referrer_user_id, commission_amount = credit_referral_bonus_if_first_service_purchase(user_id, payment_amount)
             update_payment_status(payment_id, "approved")
             flash(f"Payment #{payment_id} approved and config created.", "success")
+
+            if referral_applied and referrer_user_id:
+                flash(
+                    f"Referral bonus {commission_amount:g} credited to user {referrer_user_id}.",
+                    "success",
+                )
 
     except Exception as exc:
         logger.exception("Error approving payment")
