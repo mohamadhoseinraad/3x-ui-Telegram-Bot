@@ -12,3 +12,7 @@ PORT=443
 DB_FILE=xui_bot_.db
 ALLOW_BUY=true
 PAYMENT_MSG=for example your bank card number or payment link
+BOT_ID=vpnbot
+VLESS_TEXT=type=xhttp&encryption=none&path=%2F&host=qq.ir&mode=auto&security=tls
+SUB_PATH=sub
+SUB_PORT=8443

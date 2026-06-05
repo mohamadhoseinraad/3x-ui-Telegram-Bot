@@ -23,7 +23,7 @@ from telegram import MenuButtonCommands
 
 from client_management import show_all_clients, confirm_delete_client, delete_client_handler, cancel_delete_client
 # Import our modules
-from config import BOT_TOKEN, ADMIN_IDS, BOT_ID, IPDOMAIN, PORT, HOST, SNI, DB_FILE, ALLOW_BUY, payment_msg
+from config import BOT_TOKEN, ADMIN_IDS, BOT_ID, IPDOMAIN, PORT, VLESS_TEXT,SUB_PORT, SUB_PATH, HOST, SNI, DB_FILE, ALLOW_BUY, payment_msg
 from database import (
     init_db, get_or_create_user, get_user_configs, save_new_config,
     update_config_active_status, get_client_id_by_email, check_trial_usage,
@@ -56,9 +56,14 @@ def random_suffix(length=6):
 def generate_vless_link(client_id, email):
     """Generate a VLESS link for the client"""
     return (
-        f"vless://{client_id}@{IPDOMAIN}:{PORT}"
-        f"?type=ws&path=%2F&host={HOST}&security=tls&fp=firefox&alpn=h3%2Ch2%2Chttp%2F1.1&sni={SNI}"
+        f"vless://{client_id}@{HOST}:{PORT}"
+        f"?{VLESS_TEXT}"
         f"#{email}"
+    )
+def generate_sub_link(sub_id):
+    """Generate a subscription link for the client"""
+    return (
+        f"https://{HOST}:{SUB_PORT}/{SUB_PATH}/{sub_id}"
     )
 
 
@@ -242,12 +247,14 @@ async def _fulfill_order_with_wallet(query, user_id, context, order):
                 logger.warning(f"Failed to update database for wallet extension {email}")
 
             vless_link = generate_vless_link(client_id, email)
+            sub_link = generate_sub_link(status['subId'])
             adjust_wallet_balance(user_id, -cost)
             await query.edit_message_text(
                 f"✅ تمدید شما با کیف پول انجام شد.\n\n"
                 f"مبلغ کسر شده: {_format_wallet_amount(cost)}\n"
                 f"موجودی باقی‌مانده: {_format_wallet_amount(get_wallet_balance(user_id))}\n\n"
-                f"🔗 لینک کانفیگ شما:\n`{vless_link}`",
+                f"🔗 لینک کانفیگ شما:\n`{vless_link}`"
+                f"🔗 لینک سابسکریپشن :\n {sub_link}",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(get_back_to_main_button())
             )
@@ -572,7 +579,7 @@ async def handle_show_status(query, email, user_id):
     update_config_active_status(email, user_id, status['is_active'])
 
     vless_link = generate_vless_link(client_id, email)
-
+    sub_link = generate_sub_link(status['subId'])
     status_icon = "✅" if status['is_active'] else "❌"
     message = (
         f"{status_icon} وضعیت سرویس:\n"
@@ -580,7 +587,8 @@ async def handle_show_status(query, email, user_id):
         f"📊 حجم باقیمانده: {status['remaining_gb']} گیگابایت از {status['total_gb']} گیگابایت\n"
         f"⏳ زمان باقیمانده: {status['remaining_time_display']} (تا {status['expiry_date']})\n"
         f"🔌 وضعیت: {'فعال' if status['is_active'] else 'غیرفعال'}\n\n"
-        f"🔗 لینک کانفیگ:\n`{vless_link}`"
+        f"🔗 لینک کانفیگ:\n`{vless_link}` \n"
+        f"🔗 لینک سابسکریپشن :\n {sub_link}"
     )
 
     reply_markup = get_config_status_keyboard()
@@ -1744,14 +1752,16 @@ async def approve_payment(query, payment_id, context: ContextTypes.DEFAULT_TYPE)
 
             # Generate VLESS link
             vless_link = generate_vless_link(extension_client_id, extension_email)
-
+            sub_link = generate_sub_link(status['subId'])
             # Notify the user about their approved extension
             await context.bot.send_message(
                 chat_id=user_id,
                 text=f"✅ درخواست تمدید شما تأیید شد!\n\n"
                      f"حجم {plan_gb} گیگابایت به سرویس شما اضافه شد\n"
                      f"تاریخ انقضا به تاریخ سراسری تنظیم شد\n\n"
-                     f"🔗 لینک کانفیگ شما:\n`{vless_link}`",
+                     f"🔗 لینک کانفیگ شما:\n`{vless_link}`"
+                     f"🔗 لینک سابسکریپشن شما:\n`{sub_link}`",
+
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(get_back_to_main_button())
             )

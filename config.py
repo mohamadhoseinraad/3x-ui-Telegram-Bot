@@ -42,10 +42,13 @@ INBOUND_ID = int(os.getenv("INBOUND_ID", os.getenv("INBOUND", "1")))
 
 # Server configuration
 IPDOMAIN = os.getenv("IPDOMAIN", "")
+VLESS_TEXT = os.getenv("VLESS_TEXT","")
 DOMAIN = os.getenv("DOMAIN", "")
 PORT = int(os.getenv("PORT", os.getenv("SERVER_PORT", "443")))
 HOST = os.getenv("HOST", "")
 SNI = os.getenv("SNI", "")
+SUB_PORT = int(os.getenv("SUB_PORT", "0"))
+SUB_PATH = os.getenv("SUB_PATH", "sub")
 
 # Database configuration
 DB_FILE = os.getenv("DB_FILE", "xui_bot_.db")

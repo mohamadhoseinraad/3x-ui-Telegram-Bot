@@ -116,7 +116,8 @@ def get_client_status(email):
             'total_gb': round(total_bytes / (1024 ** 3), 2),
             'expiry_time_ms': int(data.get('expiryTime', 0)),
             'expiry_date': datetime.fromtimestamp(expiry_time).strftime('%Y-%m-%d'),
-            'is_active': data.get('enable', False)
+            'is_active': data.get('enable', False),
+            'subId': data.get('subId', None)
         }
     except Exception as e:
         logger.error(f"Error parsing client status: {e}")
