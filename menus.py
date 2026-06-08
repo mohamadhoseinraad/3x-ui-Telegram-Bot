@@ -6,6 +6,7 @@ import time
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from database import DEFAULT_VPN_PLANS, get_vpn_plans
+from config import USE_ONE_MONTH_MODE 
 
 VPN_PLANS = {plan['plan_key']: plan for plan in DEFAULT_VPN_PLANS}
 
@@ -34,6 +35,8 @@ def build_vpn_plans(policy=None):
         plan_name = plan["name"]
         if days_until_expiry is not None:
             plan_name = f"{int(days_until_expiry)} روزه"
+        if USE_ONE_MONTH_MODE:
+            plan_name = "یک ماهه"
 
         plans[plan_key] = {**plan, "name": plan_name}
 

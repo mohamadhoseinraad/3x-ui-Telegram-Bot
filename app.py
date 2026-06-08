@@ -93,7 +93,7 @@ def random_suffix(length=6):
 def generate_vless_link(client_id, email):
     return (
         f"vless://{client_id}@{IPDOMAIN}:{PORT}"
-        f"?type=ws&path=%2F&host={HOST}&security=tls&fp=firefox&alpn=h3%2Ch2%2Chttp%2F1.1&sni={SNI}"
+        f"?{VLESS_TEXT}"
         f"#{email}"
     )
 

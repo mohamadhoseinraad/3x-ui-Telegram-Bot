@@ -65,4 +65,4 @@ def get_payment_msg():
     return random.choice(_payment_msg_options) if _payment_msg_options else payment_msg
 
 ALLOW_BUY = os.getenv("ALLOW_BUY", "False").lower() in ("1", "true", "yes", "y")
-USE_ONE_MONTH_MODE = os.getenv("USE_ONE_MONTH_MODE", "False")
+USE_ONE_MONTH_MODE = os.getenv("USE_ONE_MONTH_MODE", "False").lower() in ("1", "true", "yes", "y")
