@@ -16,7 +16,7 @@ from flask import make_response
 from werkzeug.security import check_password_hash, generate_password_hash
 
 import config
-from config import ADMIN_IDS, BOT_ID, DB_FILE, HOST, IPDOMAIN, PORT, SNI, payment_msg
+from config import ADMIN_IDS, BOT_ID, DB_FILE, HOST, IPDOMAIN, PORT, SNI, get_payment_msg
 from database import (
     add_ticket_message,
     consume_invite_code,
@@ -93,7 +93,7 @@ def random_suffix(length=6):
 def generate_vless_link(client_id, email):
     return (
         f"vless://{client_id}@{IPDOMAIN}:{PORT}"
-        f"?type=ws&path=%2F&host={HOST}&security=tls&fp=firefox&alpn=h3%2Ch2%2Chttp%2F1.1&sni={SNI}"
+        f"?{VLESS_TEXT}"
         f"#{email}"
     )
 
@@ -478,7 +478,7 @@ def buy_service():
         "buy.html",
         plans=build_vpn_plans(get_service_policy()),
         allow_buy=config.ALLOW_BUY,
-        payment_msg=payment_msg,
+        payment_msg=get_payment_msg(),
     )
 
 
