@@ -24,6 +24,8 @@ This Telegram bot provides a user-friendly interface for managing VPN services. 
 2. Install the required dependencies:
    ```
    pip install python-telegram-bot requests
+   python3 -m venv ./venv
+   source ./venv/bin/activate
    ```
 3. Configure the settings in `config.py`
 

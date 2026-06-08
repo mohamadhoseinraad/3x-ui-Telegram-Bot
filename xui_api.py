@@ -7,7 +7,7 @@ import logging
 import time
 from datetime import datetime, timedelta
 import uuid
-from config import XUI_URL, XUI_USERNAME, XUI_PASSWORD, INBOUND_ID
+from config import XUI_URL, XUI_USERNAME, XUI_PASSWORD, INBOUND_ID, USE_ONE_MONTH_MODE
 
 logger = logging.getLogger(__name__)
 session = requests.Session()
@@ -123,6 +123,22 @@ def get_client_status(email):
         logger.error(f"Error parsing client status: {e}")
         return None
 
+def _normalize_expiry_time(expiry_time_ms):
+    """Normalize expiry time to a millisecond timestamp.
+
+    If the expiry time is not provided or invalid, use 30 days from now.
+    """
+    try:
+        expiry_time_ms = int(expiry_time_ms)
+    except (TypeError, ValueError):
+        expiry_time_ms = 0
+
+    if expiry_time_ms <= 0:
+        expiry_time_ms = int((datetime.now() + timedelta(days=30)).timestamp() * 1000)
+
+    return expiry_time_ms
+
+
 def create_client(email, total_gb, expiry_time_ms):
     """Create a new client in the XUI panel"""
     if not ensure_authenticated():
@@ -130,7 +146,8 @@ def create_client(email, total_gb, expiry_time_ms):
 
     client_id = str(uuid.uuid4())
     total_gb = int(total_gb)
-    expiry_time_ms = int(expiry_time_ms)
+    if USE_ONE_MONTH_MODE:
+        expiry_time_ms = _normalize_expiry_time(expiry_time_ms)
 
     settings = {
         "clients": [
@@ -214,13 +231,17 @@ def extend_client(email, client_id, additional_gb, new_expiry_time_ms=None):
     new_total_gb = current_total_gb + additional_gb
     total_bytes = int(new_total_gb * (1024 ** 3))  # Convert GB to bytes
 
-    if new_expiry_time_ms is None:
-        expiry_time_ms = client_status.get('expiry_time_ms') or int(time.time() * 1000)
-    elif isinstance(new_expiry_time_ms, timedelta):
-        current_expiry = datetime.fromtimestamp((client_status.get('expiry_time_ms') or int(time.time() * 1000)) / 1000)
-        expiry_time_ms = int((current_expiry + new_expiry_time_ms).timestamp() * 1000)
+    if USE_ONE_MONTH_MODE:
+        current_expiry = datetime.fromtimestamp((client_status.get('expiry_time_ms')) / 1000)
+        expiry_time_ms = int((current_expiry + timedelta(days=30)).timestamp() * 1000)
     else:
-        expiry_time_ms = int(new_expiry_time_ms)
+        if new_expiry_time_ms is None:
+            expiry_time_ms = client_status.get('expiry_time_ms') or int(time.time() * 1000)
+        elif isinstance(new_expiry_time_ms, timedelta):
+            current_expiry = datetime.fromtimestamp((client_status.get('expiry_time_ms') or int(time.time() * 1000)) / 1000)
+            expiry_time_ms = int((current_expiry + new_expiry_time_ms).timestamp() * 1000)
+        else:
+            expiry_time_ms = int(new_expiry_time_ms)
 
 
     # Prepare the settings for client update

@@ -16,7 +16,7 @@ from flask import make_response
 from werkzeug.security import check_password_hash, generate_password_hash
 
 import config
-from config import ADMIN_IDS, BOT_ID, DB_FILE, HOST, IPDOMAIN, PORT, SNI, payment_msg
+from config import ADMIN_IDS, BOT_ID, DB_FILE, HOST, IPDOMAIN, PORT, SNI, get_payment_msg
 from database import (
     add_ticket_message,
     consume_invite_code,
@@ -478,7 +478,7 @@ def buy_service():
         "buy.html",
         plans=build_vpn_plans(get_service_policy()),
         allow_buy=config.ALLOW_BUY,
-        payment_msg=payment_msg,
+        payment_msg=get_payment_msg(),
     )
 
 

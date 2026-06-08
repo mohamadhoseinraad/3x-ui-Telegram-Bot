@@ -23,7 +23,7 @@ from telegram import MenuButtonCommands
 
 from client_management import show_all_clients, confirm_delete_client, delete_client_handler, cancel_delete_client
 # Import our modules
-from config import BOT_TOKEN, ADMIN_IDS, BOT_ID, IPDOMAIN, PORT, VLESS_TEXT,SUB_PORT, SUB_PATH, HOST, SNI, DB_FILE, ALLOW_BUY, payment_msg
+from config import BOT_TOKEN, ADMIN_IDS, BOT_ID, IPDOMAIN, PORT, VLESS_TEXT,SUB_PORT, SUB_PATH, HOST, SNI, DB_FILE, ALLOW_BUY, get_payment_msg 
 from database import (
     init_db, get_or_create_user, get_user_configs, save_new_config,
     update_config_active_status, get_client_id_by_email, check_trial_usage,
@@ -526,7 +526,7 @@ async def prompt_direct_receipt(query, context: ContextTypes.DEFAULT_TYPE, order
     await query.edit_message_text(
         f"لطفاً فیش پرداخت برای {order['label']} را ارسال کنید.\n\n"
         "پس از تأیید ادمین، سرویس شما فعال یا تمدید خواهد شد.\n"
-        f"{payment_msg}",
+        f"{get_payment_msg()}",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("❌ انصراف", callback_data=order['back_callback'])]
         ])

@@ -2,6 +2,8 @@
 Configuration settings for the VPN bot
 """
 import os
+import random
+import re
 from pathlib import Path
 
 def _load_dotenv(dotenv_path: str | Path = ".env") -> None:
@@ -54,5 +56,13 @@ SUB_PATH = os.getenv("SUB_PATH", "sub")
 DB_FILE = os.getenv("DB_FILE", "xui_bot_.db")
 
 # Payment message and feature flags
-payment_msg = os.getenv("PAYMENT_MSG", "for example your bank card number or payment link")
+_payment_msg_raw = os.getenv("PAYMENT_MSG", "for example your bank card number or payment link")
+payment_msg = _payment_msg_raw
+_payment_msg_options = [msg.strip() for msg in re.split(r"[;,\n]+", _payment_msg_raw) if msg.strip()]
+
+def get_payment_msg():
+    """Return a randomly selected payment message from configured values."""
+    return random.choice(_payment_msg_options) if _payment_msg_options else payment_msg
+
 ALLOW_BUY = os.getenv("ALLOW_BUY", "False").lower() in ("1", "true", "yes", "y")
+USE_ONE_MONTH_MODE = os.getenv("USE_ONE_MONTH_MODE", "False")
