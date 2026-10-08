@@ -1,0 +1,24 @@
+BOT_TOKEN=TELBOT_TOKEN
+ADMIN_IDS=TELEGRAM_USERID,TELEGRAM_USERID
+
+
+IPDOMAIN=ip
+
+DB_FILE=xui_bot_.db
+ALLOW_BUY=true
+PAYMENT_MSG=for example your bank card number or payment link
+BOT_ID=vpnbot
+
+# --- OPTIONAL: INITIAL SERVER (Legacy) ---
+# Servers are now stored dynamically in the database and managed via the Telegram Admin Panel.
+# You do NOT need to fill these out if you plan to add your servers directly through the bot.
+# Option A: Multi-server JSON
+SERVERS_JSON=[{"id":"de1","name":"Germany 1","url":"https://panel1.example.com","username":"admin","password":"pass1","inbound_id":1,"host":"de1.example.com","port":443,"sni":"de1.example.com","vless_text":"type=tcp&security=reality","sub_port":2096,"sub_path":"sub"},{"id":"nl1","name":"Netherlands 1","url":"https://panel2.example.com","username":"admin","password":"pass2","inbound_id":1,"host":"nl1.example.com","port":443,"sni":"nl1.example.com","vless_text":"type=tcp&security=reality","sub_port":2096,"sub_path":"sub"}]
+
+# Option B: Legacy single server (still supported)
+# XUI_URL=https://panel.example.com
+# XUI_USERNAME=admin
+# XUI_PASSWORD=pass
+# INBOUND_ID=1
+# HOST=example.com
+# PORT=443

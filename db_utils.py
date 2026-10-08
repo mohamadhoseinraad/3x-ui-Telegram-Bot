@@ -49,31 +49,25 @@ def delete_config_by_client_id(client_id):
         conn.close()
 
 def get_all_db_configs():
-    """Get all client configurations from the database
-
-    Returns:
-        list: List of client configurations with user information
-    """
+    """Get all client configurations from the database (includes server_id)."""
     import sqlite3
     from config import DB_FILE
 
     conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row  # This enables column access by name
+    conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
     try:
-        # Join configs with users table to get user information
         cursor.execute('''
         SELECT 
             c.config_id, c.user_id, c.email, c.client_id, c.total_gb, 
-            c.created_at, c.is_active, c.last_notified,
+            c.created_at, c.is_active, c.last_notified, c.server_id,
             u.username, u.first_name
         FROM configs c
         LEFT JOIN users u ON c.user_id = u.user_id
         ORDER BY c.created_at DESC
         ''')
 
-        # Convert to list of dictionaries for easier access
         configs = [dict(row) for row in cursor.fetchall()]
         return configs
     except Exception as e:

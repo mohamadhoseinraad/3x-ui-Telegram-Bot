@@ -1,5 +1,5 @@
 """
-Client management functions for VPN Telegram Bot
+Client management functions for VPN Telegram Bot - Multi-server support
 """
 import logging
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -9,7 +9,7 @@ import config
 logger = logging.getLogger(__name__)
 
 async def show_all_clients(query, context, page=0, admin_ids=config.ADMIN_IDS):
-    """Show all clients with pagination, combining XUI panel data and database data"""
+    """Show all clients across all servers with pagination."""
     if admin_ids is None:
         admin_ids = []
 
@@ -17,43 +17,34 @@ async def show_all_clients(query, context, page=0, admin_ids=config.ADMIN_IDS):
         await query.answer("دسترسی رد شد.")
         return
 
-    # Import functions to get clients from both sources
-    from xui_api import get_all_clients
+    from xui_api import get_all_clients_multi_server
     from db_utils import get_all_db_configs
 
-    # Get all clients from XUI panel
-    xui_clients = get_all_clients() or []
-
-    # Get all clients from database
+    xui_clients = get_all_clients_multi_server() or []
     db_clients = get_all_db_configs() or []
 
-    # Create a dictionary to store the merged clients, using client_id as key
     all_clients = {}
 
-    # Process XUI clients first
     for client in xui_clients:
         client_id = client.get('id')
         if client_id:
-            # Mark as existing in XUI
             client['in_xui'] = True
             all_clients[client_id] = client
 
-    # Process database clients, adding or updating information
     for client in db_clients:
         client_id = client.get('client_id')
         if client_id:
             if client_id in all_clients:
-                # Client exists in both places, update with database info
                 all_clients[client_id].update({
                     'user_id': client.get('user_id'),
                     'username': client.get('username'),
                     'first_name': client.get('first_name'),
                     'db_total_gb': client.get('total_gb'),
                     'created_at': client.get('created_at'),
+                    'server_id': client.get('server_id'),
                     'in_db': True
                 })
             else:
-                # Client only exists in database
                 all_clients[client_id] = {
                     'id': client_id,
                     'email': client.get('email'),
@@ -63,11 +54,11 @@ async def show_all_clients(query, context, page=0, admin_ids=config.ADMIN_IDS):
                     'username': client.get('username'),
                     'first_name': client.get('first_name'),
                     'created_at': client.get('created_at'),
+                    'server_id': client.get('server_id'),
                     'in_db': True,
                     'in_xui': False
                 }
 
-    # Convert dictionary back to list
     clients = list(all_clients.values())
 
     if not clients:
@@ -77,25 +68,18 @@ async def show_all_clients(query, context, page=0, admin_ids=config.ADMIN_IDS):
         )
         return
 
-    # Define a sorting key function that handles different timestamp formats
     def get_sort_key(client):
-        # First try to get created_at timestamp
         created_at = client.get('created_at')
         if created_at:
-            # Convert string timestamp to int if it's a string
             if isinstance(created_at, str):
                 try:
-                    # Try parsing ISO format timestamp
-                    import time
                     from datetime import datetime
                     dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
                     return int(dt.timestamp())
                 except (ValueError, TypeError):
-                    # If parsing fails, return 0
                     return 0
             return created_at
 
-        # Fall back to expiryTime
         expiry_time = client.get('expiryTime', 0)
         if isinstance(expiry_time, str):
             try:
@@ -104,18 +88,15 @@ async def show_all_clients(query, context, page=0, admin_ids=config.ADMIN_IDS):
                 return 0
         return expiry_time or 0
 
-    # Sort clients using the custom key function
     clients.sort(key=get_sort_key, reverse=True)
 
-    # Pagination settings
     items_per_page = 5
     total_pages = (len(clients) + items_per_page - 1) // items_per_page
-    page = max(0, min(page, total_pages - 1))  # Ensure page is within valid range
+    page = max(0, min(page, total_pages - 1))
     start_index = page * items_per_page
     end_index = min(start_index + items_per_page, len(clients))
     current_page_clients = clients[start_index:end_index]
 
-    # Generate the message with client information
     message = f"👨‍💻 لیست کلاینت ها (صفحه {page + 1} از {total_pages}):\n"
     message += f"📊 تعداد کل: {len(clients)} | 🔌 پنل: {len(xui_clients)} | 💾 دیتابیس: {len(db_clients)}\n\n"
 
@@ -126,33 +107,31 @@ async def show_all_clients(query, context, page=0, admin_ids=config.ADMIN_IDS):
         expiry_date = client.get('expiry_date', 'نامشخص')
         active_status = "✅ فعال" if client.get('is_active', client.get('enable', False)) else "❌ غیرفعال"
         remaining_time = client.get('remaining_time_display', 'نامشخص')
+        server_name = client.get('server_name', client.get('server_id', '?'))
 
-        # Location indicators
         location = ""
         if client.get('in_xui', False) and client.get('in_db', False):
-            location = "📱💾" # In both XUI and DB
+            location = "📱💾"
         elif client.get('in_xui', False):
-            location = "📱"  # Only in XUI
+            location = "📱"
         elif client.get('in_db', False):
-            location = "💾"  # Only in DB
+            location = "💾"
 
-        # User information
         user_info = ""
         if client.get('username') or client.get('first_name'):
             user_info = f"👤 کاربر: {client.get('first_name', '')} (@{client.get('username', '')})\n   "
 
         message += (
             f"{i}. {location} {email}\n"
+            f"   🖥️ سرور: {server_name}\n"
             f"   {user_info}📊 حجم: {remaining_gb}/{total_gb} GB\n"
             f"   ⏳ زمان: {remaining_time} (تا {expiry_date})\n"
             f"   🔌 وضعیت: {active_status}\n"
             f"   🆔 شناسه: {client.get('id', 'نامشخص')[:8]}...\n\n"
         )
 
-    # Create pagination and action buttons
     keyboard = []
 
-    # Add buttons for each client on the current page
     for i, client in enumerate(current_page_clients, start=1):
         client_id = client.get('id', '')
         email = client.get('email', 'بدون نام')
@@ -161,7 +140,6 @@ async def show_all_clients(query, context, page=0, admin_ids=config.ADMIN_IDS):
                 InlineKeyboardButton(f"❌ حذف {email}", callback_data=f"admin_delete_client_{client_id}")
             ])
 
-    # Add pagination navigation
     navigation_buttons = []
     if page > 0:
         navigation_buttons.append(InlineKeyboardButton("⬅️ قبلی", callback_data=f"admin_clients_page_{page - 1}"))
@@ -170,10 +148,8 @@ async def show_all_clients(query, context, page=0, admin_ids=config.ADMIN_IDS):
     if navigation_buttons:
         keyboard.append(navigation_buttons)
 
-    # Add back button
     keyboard.append([InlineKeyboardButton("🔙 بازگشت", callback_data="admin_menu")])
 
-    # Save current client list in context for later use
     context.user_data['client_list'] = clients
 
     await query.edit_message_text(
@@ -181,8 +157,9 @@ async def show_all_clients(query, context, page=0, admin_ids=config.ADMIN_IDS):
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
+
 async def confirm_delete_client(query, client_id, admin_ids=config.ADMIN_IDS):
-    """Ask for confirmation before deleting a client"""
+    """Ask for confirmation before deleting a client."""
     if admin_ids is None:
         admin_ids = []
 
@@ -199,31 +176,29 @@ async def confirm_delete_client(query, client_id, admin_ids=config.ADMIN_IDS):
         ])
     )
 
+
 async def delete_client_handler(query, client_id, admin_ids=config.ADMIN_IDS):
-    """Handle client deletion after confirmation"""
+    """Handle client deletion after confirmation - searches all servers."""
     if admin_ids is None:
         admin_ids = []
 
     if query.from_user.id not in admin_ids:
-        await query.answer("��سترسی رد شد.")
+        await query.answer("دسترسی رد شد.")
         return
 
-    # Import delete_client function
-    from xui_api import delete_client
+    from xui_api import _legacy_delete_client  # searches all servers
     from db_utils import delete_config_by_client_id
 
-    # Delete the client from XUI panel
-    success, error_message = delete_client(client_id)
+    success, error_message = _legacy_delete_client(client_id)
 
     if success:
-        # If deletion from XUI panel was successful, also delete from database
         db_success = delete_config_by_client_id(client_id)
 
         message = f"✅ کلاینت با شناسه {client_id[:8]}... با موفقیت حذف شد."
         if db_success:
             message += "\n✅ اطلاعات مربوطه از دیتابیس نیز حذف شد."
         else:
-            message += "\n⚠️ حذف از دیتابیس ناموفق بود. کاربران ممکن است همچنان کانفیگ را در لیست خود مشاهده کنند."
+            message += "\n⚠️ حذف از دیتابیس ناموفق بود."
 
         await query.edit_message_text(
             message,
@@ -242,8 +217,9 @@ async def delete_client_handler(query, client_id, admin_ids=config.ADMIN_IDS):
             ])
         )
 
+
 async def cancel_delete_client(query, client_id, context, admin_ids=config.ADMIN_IDS):
-    """Cancel client deletion and return to client list"""
+    """Cancel client deletion and return to client list."""
     if admin_ids is None:
         admin_ids = []
 
@@ -251,5 +227,4 @@ async def cancel_delete_client(query, client_id, context, admin_ids=config.ADMIN
         await query.answer("دسترسی رد شد.")
         return
 
-    # Return to the client list
     await show_all_clients(query, context, admin_ids=admin_ids)
