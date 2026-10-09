@@ -21,9 +21,17 @@ from telegram.ext import (
 from telegram import MenuButtonCommands
 
 
-from client_management import show_all_clients, confirm_delete_client, delete_client_handler, cancel_delete_client
-# Import our modules
-from config import BOT_TOKEN, ADMIN_IDS, BOT_ID, IPDOMAIN, PORT, VLESS_TEXT,SUB_PORT, SUB_PATH, HOST, SNI, DB_FILE, ALLOW_BUY, get_payment_msg 
+from client_management import (
+    show_all_clients,
+    confirm_delete_client,
+    delete_client_handler,
+    cancel_delete_client,
+    start_assign_client,
+    handle_assign_client_message,
+    pick_assign_user,
+)
+from config import BOT_TOKEN, ADMIN_IDS, BOT_ID, IPDOMAIN, PORT, VLESS_TEXT, SUB_PORT, SUB_PATH, HOST, SNI, DB_FILE, \
+    ALLOW_BUY, get_payment_msg, DOMAIN
 from database import (
     init_db, get_or_create_user, get_user_configs, save_new_config,
     update_config_active_status, get_client_id_by_email, check_trial_usage,
@@ -33,15 +41,22 @@ from database import (
     get_pending_payments, update_config_total_gb, get_all_configs_with_users,
     get_service_policy, update_app_settings,
     get_user_referral_state, credit_referral_bonus_if_first_service_purchase,
+    get_all_servers, get_server, get_active_servers, save_server, delete_server,
+    toggle_server_active, get_server_for_config, get_user_configs_with_server,
+    add_payment_card, get_active_payment_cards, get_all_payment_cards, toggle_payment_card, delete_payment_card
 )
 from database import get_vpn_plans, save_vpn_plan, delete_vpn_plan
 from menus import (
     build_vpn_plans, get_main_menu_keyboard, get_free_trial_keyboard, get_vpn_plans_keyboard,
     get_back_to_main_button, get_configs_keyboard, get_config_status_keyboard,
     get_admin_approval_keyboard, get_support_keyboard, get_admin_menu_keyboard, get_vpn_extend_plans_keyboard,
-    get_buy_allow_keyboard, get_extend_all_client_day, get_wallet_keyboard, get_payment_method_keyboard
+    get_buy_allow_keyboard, get_extend_all_client_day, get_wallet_keyboard, get_payment_method_keyboard,
+    get_server_selection_keyboard, get_admin_servers_keyboard, get_admin_server_actions_keyboard,
+    get_admin_server_fields_keyboard, get_admin_extend_server_keyboard,
+    get_admin_cards_keyboard, get_admin_card_actions_keyboard
 )
-from xui_api import get_client_status, create_client, extend_client
+from xui_api import (get_client_status, create_client, extend_client,
+    get_all_clients_multi_server, _legacy_delete_client)
 from notification_service import start_notification_service
 
 # Configure logging
@@ -49,23 +64,53 @@ logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+def _resolve_server_id(context, user_id):
+    """
+    Determine which server to use for a pending action.
+    Priority:
+      1. context.user_data['selected_server_id']
+      2. First active server from DB
+    """
+    sid = context.user_data.get('selected_server_id')
+    if sid and get_server(sid):
+        return sid
+    servers = get_active_servers()
+    if servers:
+        return servers[0][0]
+    return None
+
 def random_suffix(length=6):
     """Generate a random suffix for email addresses"""
     return ''.join(random.choices(string.ascii_lowercase + string.digits, k=length))
 
-def generate_vless_link(client_id, email):
-    """Generate a VLESS link for the client"""
+def generate_vless_link(client_id, email, server_id=None):
+    """Generate a VLESS link for the client using the correct server's settings."""
+    srv = get_server(server_id) if server_id else None
+    if srv:
+        host = srv.get('host') or HOST or IPDOMAIN or DOMAIN
+        port = srv.get('port') or PORT
+        vless_text = srv.get('vless_text') or VLESS_TEXT
+    else:
+        host, port, vless_text = HOST or IPDOMAIN or DOMAIN, PORT, VLESS_TEXT
+
     return (
-        f"vless://{client_id}@{HOST}:{PORT}"
-        f"?{VLESS_TEXT}"
+        f"vless://{client_id}@{host}:{port}"
+        f"?{vless_text}"
         f"#{email}"
     )
-def generate_sub_link(sub_id):
-    """Generate a subscription link for the client"""
-    return (
-        f"https://{HOST}:{SUB_PORT}/{SUB_PATH}/{sub_id}"
-    )
 
+
+def generate_sub_link(sub_id, server_id=None):
+    """Generate a subscription link using the correct server's settings."""
+    srv = get_server(server_id) if server_id else None
+    if srv:
+        host = srv.get('host') or HOST or IPDOMAIN or DOMAIN
+        sub_port = srv.get('sub_port') or SUB_PORT
+        sub_path = srv.get('sub_path') or SUB_PATH
+    else:
+        host, sub_port, sub_path = HOST or IPDOMAIN or DOMAIN, SUB_PORT, SUB_PATH
+
+    return f"https://{host}:{sub_port}/{sub_path}/{sub_id}"
 
 def _parse_plan_gb(plan_name):
     """Extract the plan size in GB from a plan name."""
@@ -150,7 +195,7 @@ def _parse_referrer_arg(args):
     return referrer_user_id if referrer_user_id > 0 else None
 
 
-def _build_order(kind, label, gb, amount, back_callback, email=None, client_id=None, plan_key=None):
+def _build_order(kind, label, gb, amount, back_callback, email=None, client_id=None, plan_key=None, server_id=None):
     """Store the pending purchase or extension request in user_data."""
     return {
         'kind': kind,
@@ -161,6 +206,7 @@ def _build_order(kind, label, gb, amount, back_callback, email=None, client_id=N
         'email': email,
         'client_id': client_id,
         'plan_key': plan_key,
+        'server_id': server_id,
     }
 
 
@@ -186,22 +232,32 @@ async def _send_payment_notification(context: ContextTypes.DEFAULT_TYPE, payment
     gb_text = _format_wallet_amount(order.get('gb', 0))
     payment_label = 'شارژ کیف پول' if payment_type == 'wallet_topup' else 'پرداخت سرویس'
 
+    caption = (
+        f"درخواست {payment_label}:\n"
+        f"کاربر: {user.full_name}\n"
+        f"پلن: {order['label']}\n"
+        f"حجم: {gb_text} گیگ\n"
+        f"مبلغ: {_format_price_toman(order.get('amount', 0))}"
+        f"{extension_info}\n"
+        f"شناسه پرداخت: {payment_id}"
+    )
+
     for admin_id in ADMIN_IDS:
         try:
-            await context.bot.send_photo(
-                chat_id=admin_id,
-                photo=receipt_file_id,
-                caption=(
-                    f"درخواست {payment_label}:\n"
-                    f"کاربر: {user.full_name}\n"
-                    f"پلن: {order['label']}\n"
-                    f"حجم: {gb_text} گیگ\n"
-                    f"مبلغ: {_format_price_toman(order.get('amount', 0))}"
-                    f"{extension_info}\n"
-                    f"شناسه پرداخت: {payment_id}"
-                ),
-                reply_markup=get_admin_approval_keyboard(payment_id)
-            )
+            if receipt_file_id and receipt_file_id.startswith("text:"):
+                text_content = receipt_file_id[5:]
+                await context.bot.send_message(
+                    chat_id=admin_id,
+                    text=f"{caption}\n\nمتن رسید/شماره پیگیری:\n{text_content}",
+                    reply_markup=get_admin_approval_keyboard(payment_id)
+                )
+            else:
+                await context.bot.send_photo(
+                    chat_id=admin_id,
+                    photo=receipt_file_id,
+                    caption=caption,
+                    reply_markup=get_admin_approval_keyboard(payment_id)
+                )
         except Exception as exc:
             logger.error(f"Error notifying admin {admin_id}: {exc}")
 
@@ -226,28 +282,57 @@ async def _fulfill_order_with_wallet(query, user_id, context, order):
         return False
 
     policy = get_service_policy()
+    server_id = order.get('server_id') or _resolve_server_id(context, user_id)
+    if not server_id:
+        await query.edit_message_text(
+            "⚠️ سروری انتخاب نشده است.",
+            reply_markup=InlineKeyboardMarkup(get_back_to_main_button())
+        )
+        return False
 
     try:
+        srv = get_server(server_id)
+        is_manual = srv and srv.get('type') == 'manual'
+
+        # IF SERVER IS MANUAL: Queue the order instead of instant generation
+        if is_manual:
+            adjust_wallet_balance(user_id, -cost)
+            payment_id = save_payment_request(
+                user_id, order['label'], "text:پرداخت از کیف پول",
+                payment_type=order['kind'], amount=cost,
+                target_email=order.get('email'), target_client_id=order.get('client_id'),
+                plan_key=order.get('plan_key'), plan_gb=order.get('gb'), server_id=server_id
+            )
+            await _send_payment_notification(context, payment_id, query.from_user, order, "text:پرداخت از کیف پول",
+                                             order['kind'])
+
+            await query.edit_message_text(
+                f"✅ مبلغ {_format_wallet_amount(cost)} از کیف پول شما کسر شد.\n\n"
+                "از آنجا که این سرور از نوع **دستی (Manual)** است، درخواست شما برای پشتیبانی ارسال شد و پس از بررسی، لینک کانفیگ ارسال خواهد شد.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(get_back_to_main_button())
+            )
+            return True
         if order['kind'] == 'extension':
             email = order['email']
             client_id = order['client_id']
             plan_gb = float(order['gb'])
-            status = get_client_status(email)
+            status = get_client_status(server_id, email)
             if not status:
                 raise Exception("خطا در دریافت اطلاعات سرویس فعلی")
 
             if policy['max_config_gb'] > 0 and status['total_gb'] + plan_gb > policy['max_config_gb']:
                 raise Exception(f"تمدید از محدودیت {policy['max_config_gb']} گیگابایت بیشتر می‌شود")
 
-            success, error_msg = extend_client(email, client_id, plan_gb, policy['global_expiry_time_ms'])
+            success, error_msg = extend_client(server_id, email, client_id, plan_gb, policy['global_expiry_time_ms'])
             if not success:
                 raise Exception(f"خطا در تمدید سرویس: {error_msg}")
 
             if not update_config_total_gb(email, user_id, plan_gb):
                 logger.warning(f"Failed to update database for wallet extension {email}")
 
-            vless_link = generate_vless_link(client_id, email)
-            sub_link = generate_sub_link(status['subId'])
+            vless_link = generate_vless_link(client_id, email, server_id)
+            sub_link = generate_sub_link(status['subId'], server_id)
             adjust_wallet_balance(user_id, -cost)
             await query.edit_message_text(
                 f"✅ تمدید شما با کیف پول انجام شد.\n\n"
@@ -275,14 +360,14 @@ async def _fulfill_order_with_wallet(query, user_id, context, order):
             total_bytes = int(round(plan_gb * (1024 ** 3)))
             expiry_time = policy['global_expiry_time_ms']
 
-            client_id, error = create_client(email, total_bytes, expiry_time)
+            client_id, error = create_client(server_id, email, total_bytes, expiry_time)
             if error:
                 raise Exception(f"خطا در ایجاد کانفیگ: {error}")
 
-            save_new_config(user_id, email, client_id, plan_gb)
+            save_new_config(user_id, email, client_id, plan_gb, server_id=server_id)
             referral_applied, referrer_user_id, commission_amount = credit_referral_bonus_if_first_service_purchase(user_id, cost)
             adjust_wallet_balance(user_id, -cost)
-            vless_link = generate_vless_link(client_id, email)
+            vless_link = generate_vless_link(client_id, email, server_id)
 
             await query.edit_message_text(
                 f"✅ پرداخت با کیف پول انجام شد!\n\n"
@@ -426,10 +511,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Main menu options
     if data == "check_status":
         await handle_check_status(query, user_id)
+        # In callback_handler:
     elif data == "buy_service":
-        await handle_buy_service(query, user_id)
+        context.user_data.pop('selected_server_id', None)
+        context.user_data['server_flow'] = 'buy'
+        await handle_buy_service(query, user_id, context)
     elif data == "buy_service_gift":
-        await handle_buy_service_gift(query, user_id)
+        context.user_data.pop('selected_server_id', None)
+        context.user_data['server_flow'] = 'gift'
+        await handle_buy_service_gift(query, user_id, context)
     elif data == "wallet_menu":
         await show_wallet_menu(query, user_id)
     elif data == "referral_info":
@@ -441,6 +531,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "support":
         await handle_support(query, context)
     elif data == "back_to_main":
+        context.user_data.pop('selected_server_id', None)
+        context.user_data.pop('server_flow', None)
         await show_main_menu(query)
 
     # VPN status and configuration
@@ -457,6 +549,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("free_"):
         await handle_free_trial(query, data, user_id, context)
 
+    # Server selection (user side)
+    elif data.startswith("select_server_"):
+        await handle_server_selection(query, data, user_id, context)
+
+    # Admin server management (must be checked BEFORE admin_)
+    elif data == "admin_servers" or data.startswith("admin_server_"):
+        await handle_admin_server_callback(query, data, user_id, context)
     # Admin functions
     elif data.startswith("admin_"):
         await handle_admin_callback(query, data, user_id, context)
@@ -516,6 +615,20 @@ async def prompt_wallet_topup_amount(query, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def prompt_payment_method(query, context: ContextTypes.DEFAULT_TYPE, order):
+    """Ask the user to choose between wallet and direct payment."""
+    context.user_data['pending_order'] = order
+    server_id = order.get('server_id')
+    srv = get_server(server_id) if server_id else None
+    server_info = f"\n🖥️ سرور: {srv['name']}" if srv else ""
+
+    await query.edit_message_text(
+        f"روش پرداخت برای {order['label']} را انتخاب کنید.{server_info}\n\n"
+        f"مبلغ: {_format_wallet_amount(order['amount'])}",
+        reply_markup=get_payment_method_keyboard(order['back_callback'])
+    )
+
+
 async def prompt_direct_receipt(query, context: ContextTypes.DEFAULT_TYPE, order):
     """Ask the user to send a receipt for a direct payment request."""
     context.user_data['pending_order'] = order
@@ -523,25 +636,18 @@ async def prompt_direct_receipt(query, context: ContextTypes.DEFAULT_TYPE, order
     context.user_data.pop('awaiting_wallet_topup_amount', None)
     context.user_data.pop('awaiting_wallet_topup_receipt', None)
 
+    server_id = order.get('server_id')
+    srv = get_server(server_id) if server_id else None
+    server_info = f"\n🖥️ سرور: {srv['name']}" if srv else ""
+
     await query.edit_message_text(
-        f"لطفاً فیش پرداخت برای {order['label']} را ارسال کنید.\n\n"
+        f"لطفاً تصویر فیش پرداخت یا شماره پیگیری را برای {order['label']} ارسال کنید.{server_info}\n\n"
         "پس از تأیید ادمین، سرویس شما فعال یا تمدید خواهد شد.\n"
-        f"{get_payment_msg()}",
+        f"{get_payment_msg(get_active_payment_cards())}",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("❌ انصراف", callback_data=order['back_callback'])]
         ])
     )
-
-
-async def prompt_payment_method(query, context: ContextTypes.DEFAULT_TYPE, order):
-    """Ask the user to choose between wallet and direct payment."""
-    context.user_data['pending_order'] = order
-    await query.edit_message_text(
-        f"روش پرداخت برای {order['label']} را انتخاب کنید.\n\n"
-        f"مبلغ: {_format_wallet_amount(order['amount'])}",
-        reply_markup=get_payment_method_keyboard(order['back_callback'])
-    )
-
 
 def _clear_direct_payment_context(context: ContextTypes.DEFAULT_TYPE):
     """Clear direct-payment flags after a receipt has been stored."""
@@ -563,26 +669,46 @@ async def handle_check_status(query, user_id):
     await query.edit_message_text("لطفا سرویس مورد نظر را انتخاب کنید:", reply_markup=reply_markup)
 
 async def handle_show_status(query, email, user_id):
-    """Show the status of a specific configuration"""
+    """Show the status of a specific configuration on its server."""
+    server_id = get_server_for_config(email, user_id)
     client_id = get_client_id_by_email(email, user_id)
 
-    if not client_id:
-        await query.edit_message_text("خطا در دریافت اطلاعات سر��یس." ,
+    if not client_id or not server_id:
+        await query.edit_message_text("خطا در دریافت اطلاعات سرویس.",
                                       reply_markup=InlineKeyboardMarkup(get_back_to_main_button()))
         return
 
-    status = get_client_status(email)
+    srv = get_server(server_id)
+    server_name = srv['name'] if srv else server_id
+
+    if srv and srv.get('type') == 'manual':
+        message = (
+            f"✅ وضعیت سرویس:\n"
+            f"🖥️ سرور: {server_name}\n"
+            f"📧 نام: `{email}`\n\n"
+            f"⚠️ *این سرویس آمار مصرف آن به صورت خودکار قابل دریافت نیست.*"
+        )
+        reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="check_status")]])
+        await query.edit_message_text(message, parse_mode="Markdown", reply_markup=reply_markup)
+        return
+
+    status = get_client_status(server_id, email)
     if not status:
-        await query.edit_message_text("خطا در دریافت اطلاعات سرویس.", reply_markup=InlineKeyboardMarkup(get_back_to_main_button()))
+        await query.edit_message_text("خطا در دریافت اطلاعات سرویس.",
+                                      reply_markup=InlineKeyboardMarkup(get_back_to_main_button()))
         return
 
     update_config_active_status(email, user_id, status['is_active'])
 
-    vless_link = generate_vless_link(client_id, email)
-    sub_link = generate_sub_link(status['subId'])
+    vless_link = generate_vless_link(client_id, email, server_id)
+    sub_link = generate_sub_link(status['subId'], server_id)
     status_icon = "✅" if status['is_active'] else "❌"
+    srv = get_server(server_id)
+    server_name = srv['name'] if srv else server_id
+
     message = (
         f"{status_icon} وضعیت سرویس:\n"
+        f"🖥️ سرور: {server_name}\n"
         f"📧 نام: `{email}`\n"
         f"📊 حجم باقیمانده: {status['remaining_gb']} گیگابایت از {status['total_gb']} گیگابایت\n"
         f"⏳ زمان باقیمانده: {status['remaining_time_display']} (تا {status['expiry_date']})\n"
@@ -594,11 +720,32 @@ async def handle_show_status(query, email, user_id):
     reply_markup = get_config_status_keyboard()
     await query.edit_message_text(message, parse_mode="Markdown", reply_markup=reply_markup)
 
-async def handle_buy_service(query, user_id):
-    """Handle the buy service option"""
+async def handle_buy_service(query, user_id, context: ContextTypes.DEFAULT_TYPE = None):
+    """Handle the buy service option - show server selection if multiple servers exist."""
     policy = get_service_policy()
-    keyboard = get_vpn_plans_keyboard(policy) + get_back_to_main_button()
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    servers = get_active_servers()
+
+    # Show server selection only if multiple servers exist AND user hasn't selected one yet
+    if len(servers) > 1 and context is not None and not context.user_data.get('selected_server_id'):
+        context.user_data['server_flow'] = 'buy'
+        keyboard = get_server_selection_keyboard(
+            [{'server_id': sid, 'name': name} for sid, name in servers],
+            back_callback="back_to_main"
+        )
+        await query.edit_message_text(
+            "لطفاً سرور مورد نظر خود را انتخاب کنید:",
+            reply_markup=keyboard
+        )
+        return
+
+    # Single server or server already selected: auto-assign default
+    if context is not None and servers and not context.user_data.get('selected_server_id'):
+        context.user_data['selected_server_id'] = servers[0][0]
+
+    server_id = context.user_data.get('selected_server_id') if context else None
+    srv = get_server(server_id) if server_id else None
+    server_info = f"🖥️ سرور: {srv['name']}\n\n" if srv else ""
+
     max_config_gb = policy.get("max_config_gb", 0)
     if not max_config_gb:
         max_config_label = "نامحدود"
@@ -606,16 +753,46 @@ async def handle_buy_service(query, user_id):
         val = int(max_config_gb) if float(max_config_gb).is_integer() else max_config_gb
         max_config_label = f"{val} گیگ"
 
+    keyboard = get_vpn_plans_keyboard(policy) + get_back_to_main_button()
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
     await query.edit_message_text(
-        f"لطفاً پلن مورد نظر خود را انتخاب کنید.\n هر کانفیگ حداکثر به مقدار {max_config_label} قابل شارژ است",
+        f"{server_info}لطفاً پلن مورد نظر خود را انتخاب کنید.\n هر کانفیگ حداکثر به مقدار {max_config_label} قابل شارژ است",
         reply_markup=reply_markup,
     )
 
-async def handle_buy_service_gift(query, user_id):
-    """Handle the buy gift service option"""
+
+async def handle_buy_service_gift(query, user_id, context: ContextTypes.DEFAULT_TYPE = None):
+    """Handle the buy gift service option - show server selection if multiple servers exist."""
+    servers = get_active_servers()
+
+    # Show server selection if multiple servers exist and not yet chosen
+    if len(servers) > 1 and context is not None and not context.user_data.get('selected_server_id'):
+        context.user_data['server_flow'] = 'gift'
+        keyboard = get_server_selection_keyboard(
+            [{'server_id': sid, 'name': name} for sid, name in servers],
+            back_callback="back_to_main"
+        )
+        await query.edit_message_text(
+            "🎁 دریافت سرویس هدیه و تست\n\nلطفاً سرور مورد نظر خود را انتخاب کنید:",
+            reply_markup=keyboard
+        )
+        return
+
+    # Single server or server already chosen
+    if context is not None and servers and not context.user_data.get('selected_server_id'):
+        context.user_data['selected_server_id'] = servers[0][0]
+
+    server_id = context.user_data.get('selected_server_id') if context else None
+    srv = get_server(server_id) if server_id else None
+    server_info = f"🖥️ سرور: {srv['name']}\n\n" if srv else ""
+
     keyboard = get_free_trial_keyboard() + get_back_to_main_button()
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.edit_message_text("لطفاً پلن مورد نظر خود را انتخاب کنید.", reply_markup=reply_markup)
+    await query.edit_message_text(
+        f"{server_info}لطفاً پلن هدیه مورد نظر خود را انتخاب کنید:",
+        reply_markup=reply_markup
+    )
 
 async def handle_support(query, context: ContextTypes.DEFAULT_TYPE):
     """Handle the support option"""
@@ -625,12 +802,13 @@ async def handle_support(query, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle_plan_selection(query, plan_data, user_id, context: ContextTypes.DEFAULT_TYPE):
-    """Handle the selection of a VPN plan"""
+    """Handle the selection of a VPN plan."""
     import config
-    if not config.ALLOW_BUY :
+    if not config.ALLOW_BUY:
         reply_markup = InlineKeyboardMarkup(get_back_to_main_button())
         await query.edit_message_text("فروش فعال نیست.", reply_markup=reply_markup)
         return
+
     policy = get_service_policy()
     plan_key = plan_data[len("plan_"):]
     plan = build_vpn_plans(policy).get(plan_key)
@@ -647,7 +825,19 @@ async def handle_plan_selection(query, plan_data, user_id, context: ContextTypes
         )
         return
 
-    order = _build_order('service', plan['name'], plan['gb'], plan['price'], 'buy_service', plan_key=plan_key)
+    server_id = _resolve_server_id(context, user_id)
+    if not server_id:
+        await query.edit_message_text(
+            "تمام سرور ها غیر فعال اند.",
+            reply_markup=InlineKeyboardMarkup(get_back_to_main_button())
+        )
+        return
+
+    order = _build_order(
+        'service', plan['name'], plan['gb'], plan['price'],
+        'buy_service', plan_key=plan_key
+    )
+    order['server_id'] = server_id
     await prompt_payment_method(query, context, order)
 
 async def handle_free_trial(query, data, user_id, context: ContextTypes.DEFAULT_TYPE):
@@ -695,15 +885,32 @@ async def handle_free_trial(query, data, user_id, context: ContextTypes.DEFAULT_
     expiry_time = policy['global_expiry_time_ms']
 
     try:
-        client_id, error = create_client(email, total_bytes, expiry_time)
+        server_id = _resolve_server_id(context, user_id)
+        if not server_id:
+            raise Exception("سروری موجود نیست")
+
+        srv = get_server(server_id)
+        if srv and srv.get('type') == 'manual':
+            await query.edit_message_text(
+                "❌ دریافت هدیه روی این سرورامکان‌پذیر نیست.",
+                reply_markup=reply_markup
+            )
+            return
+
+        client_id, error = create_client(server_id, email, total_bytes, expiry_time)
         if error:
             raise Exception(error)
 
-        save_new_config(user_id, email, client_id, gb_amount)
-        vless_link = generate_vless_link(client_id, email)
+        save_new_config(user_id, email, client_id, gb_amount, server_id=server_id)
+        vless_link = generate_vless_link(client_id, email, server_id)
+
+        srv = get_server(server_id)
+        server_name = srv['name'] if srv else ""
 
         await query.edit_message_text(
-            f"🎉 هدیه شما آماده شد!\n\n🔗 لینک کانفیگ:\n`{vless_link}`",
+            f"🎉 هدیه شما آماده شد!\n\n"
+            f"🖥️ سرور: {server_name}\n\n"
+            f"🔗 لینک کانفیگ:\n`{vless_link}`",
             parse_mode="Markdown",
             reply_markup=reply_markup
         )
@@ -741,16 +948,14 @@ async def handle_payment_method_choice(query, data, user_id, context: ContextTyp
     )
 
 
-async def handle_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle receipt photos sent by users"""
+async def process_receipt_submission(update: Update, context: ContextTypes.DEFAULT_TYPE, photo_file_id=None,
+                                     text_data=None):
     keyboard = get_back_to_main_button()
-
-    if not update.message.photo:
-        await update.message.reply_text("لطفاً یک تصویر از فیش پرداخت ارسال کنید.")
-        return
-
-    photo = update.message.photo[-1]
     user_id = update.effective_user.id
+
+    # Prefix text submissions so the bot knows how to display them later
+    receipt_ref = f"text:{text_data}" if text_data else photo_file_id
+
     if context.user_data.get('awaiting_wallet_topup_receipt'):
         amount = context.user_data.get('wallet_topup_amount')
         if amount is None:
@@ -761,16 +966,17 @@ async def handle_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         payment_id = save_payment_request(
             user_id,
             order['label'],
-            photo.file_id,
+            receipt_ref,
             payment_type='wallet_topup',
             amount=amount,
             plan_key='wallet_topup',
             plan_gb=0,
+            server_id=None,
         )
-        await _send_payment_notification(context, payment_id, update.effective_user, order, photo.file_id, 'wallet_topup')
+        await _send_payment_notification(context, payment_id, update.effective_user, order, receipt_ref, 'wallet_topup')
 
         await update.message.reply_text(
-            f"فیش شارژ کیف پول شما دریافت شد و در انتظار تأیید ادمین است.\n"
+            f"فیش/شماره پیگیری شارژ کیف پول شما دریافت شد و در انتظار تأیید ادمین است.\n"
             f"مبلغ درخواستی: {_format_wallet_amount(amount)}",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
@@ -783,39 +989,69 @@ async def handle_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         payment_id = save_payment_request(
             user_id,
             order['label'],
-            photo.file_id,
+            receipt_ref,
             payment_type=payment_type,
             amount=order['amount'],
             target_email=order.get('email'),
             target_client_id=order.get('client_id'),
             plan_key=order.get('plan_key'),
-            plan_gb=order.get('gb')
+            plan_gb=order.get('gb'),
+            server_id=order.get('server_id'),
         )
-        await _send_payment_notification(context, payment_id, update.effective_user, order, photo.file_id, payment_type)
+        await _send_payment_notification(context, payment_id, update.effective_user, order, receipt_ref, payment_type)
 
         await update.message.reply_text(
-            "فیش پرداخت شما دریافت شد و در انتظار تأیید ادمین است.\n"
+            "فیش/شماره پیگیری پرداخت شما دریافت شد و در انتظار تأیید ادمین است.\n"
             "پس از تأیید، سرویس برای شما فعال یا تمدید خواهد شد.",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         _clear_direct_payment_context(context)
         return
 
-    await update.message.reply_text(
-        "لطفاً ابتدا از منوی خرید یا کیف پول یکی از گزینه‌ها را انتخاب کنید.",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+
+async def handle_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle receipt photos sent by users"""
+    if not update.message.photo:
+        return
+
+    if context.user_data.get('awaiting_wallet_topup_receipt') or (
+            context.user_data.get('awaiting_direct_receipt') and context.user_data.get('pending_order')):
+        photo = update.message.photo[-1]
+        await process_receipt_submission(update, context, photo_file_id=photo.file_id)
+    else:
+        keyboard = get_back_to_main_button()
+        await update.message.reply_text(
+            "لطفاً ابتدا از منوی خرید یا کیف پول یکی از گزینه‌ها را انتخاب کنید.",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
 
 # Admin handling functions
 async def handle_admin_extend_all(query, context, data):
-
     if query.from_user.id not in ADMIN_IDS:
         await query.answer("دسترسی رد شد.")
         return
+
     if data == "admin_extend_all":
-        await query.edit_message_text("تعداد روز را انتخاب کنید" , reply_markup= get_extend_all_client_day())
-    else:
-        day = int (data.replace("admin_extend_all_",""))
+        servers = get_active_servers()
+        if not servers:
+            await query.edit_message_text("هیچ سرور فعالی یافت نشد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("برگشت", callback_data="admin_menu")]]))
+            return
+        full_servers = [get_server(s[0]) for s in servers]
+        await query.edit_message_text("سرور مورد نظر برای افزایش زمان را انتخاب کنید:", reply_markup=get_admin_extend_server_keyboard(full_servers))
+
+    elif data.startswith("admin_ext_srv_"):
+        server_id = data.replace("admin_ext_srv_", "")
+        target_name = "همه سرورها" if server_id == "all" else f"سرور {server_id}"
+        await query.edit_message_text(
+            f"تعداد روز برای افزایش زمان کلاینت‌های {target_name} را انتخاب کنید:",
+            reply_markup=get_extend_all_client_day(server_id)
+        )
+
+    elif data.startswith("admin_ext_days_"):
+        # Format: admin_ext_days_{server_id}_{days}
+        parts = data.replace("admin_ext_days_", "").split("_")
+        server_id = parts[0]
+        day = int(parts[1])
 
         configs = get_all_configs_with_users()
         c = 0
@@ -823,12 +1059,22 @@ async def handle_admin_extend_all(query, context, data):
             config_id = config['client_id']
             user_id = config['user_id']
             email = config['email']
-            success, err = extend_client(email, config_id,0,timedelta(days=day))
-            sucDB = update_config_total_gb(email, user_id, 0)
-            if sucDB and success:
-                c = c + 1
-        key =  InlineKeyboardMarkup([[InlineKeyboardButton("برگشت", callback_data="admin_menu")]])
-        await query.edit_message_text(f"{c} کلاینت افزایش داده شدند", reply_markup=key)
+            cfg_server_id = config.get('server_id')
+
+            if not cfg_server_id:
+                continue
+
+            # Skip if we selected a specific server and this config belongs to a different one
+            if server_id != 'all' and str(cfg_server_id) != str(server_id):
+                continue
+
+            success, err = extend_client(cfg_server_id, email, config_id, 0, timedelta(days=day))
+            if success:
+                update_config_total_gb(email, user_id, 0)
+                c += 1
+
+        key = InlineKeyboardMarkup([[InlineKeyboardButton("برگشت", callback_data="admin_menu")]])
+        await query.edit_message_text(f"✅ زمان {c} کلاینت با موفقیت افزایش یافت.", reply_markup=key)
 
 
 async def handle_admin_callback(query, data, user_id, context: ContextTypes.DEFAULT_TYPE):
@@ -852,6 +1098,18 @@ async def handle_admin_callback(query, data, user_id, context: ContextTypes.DEFA
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("❌ انصراف", callback_data="admin_menu")]
             ])
+        )
+
+        # NEW: Admin direct message to a specific user
+    elif data == "admin_msg_user":
+        context.user_data['awaiting_admin_msg_user'] = True
+        await query.edit_message_text(
+            "✉️ **ارسال پیام مستقیم به کاربر**\n\n"
+            "لطفاً آیدی عددی کاربر و متن پیام را با فرمت `user_id|متن پیام` بفرستید.\n"
+            "مثال: `123456789|سلام، قطعی سرور برطرف شد.`\n\n"
+            "برای لغو /admin را بزنید.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_menu")]])
         )
     elif data == "admin_service_policy":
         await show_service_policy(query)
@@ -885,8 +1143,130 @@ async def handle_admin_callback(query, data, user_id, context: ContextTypes.DEFA
         await cancel_delete_client(query, client_id, context)
     elif data.startswith("admin_buy_allow"):
         await show_buy_allow(query, data)
-    elif data.startswith("admin_extend_all"):
-        await handle_admin_extend_all(query, context , data)
+    elif data.startswith("admin_extend_all") or data.startswith("admin_ext_"):
+        await handle_admin_extend_all(query, context, data)
+    elif data == "admin_charge_wallet":
+        context.user_data['awaiting_user_wallet_charge'] = True
+        await query.edit_message_text(
+            "💰 **شارژ کیف پول کاربر**\n\n"
+            "لطفاً آیدی عددی کاربر و مبلغ را با فرمت `user_id|amount` بفرستید.\n"
+            "مثال: `123456789|50000`\n"
+            "*(برای کاهش موجودی از عدد منفی استفاده کنید، مثلاً `-50000`)*\n\n"
+            "برای لغو /admin را بزنید.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_menu")]])
+        )
+
+    elif data == "admin_assign_config":
+        context.user_data['awaiting_admin_assign_userid'] = True
+        await query.edit_message_text(
+            "➕ **ایجاد کانفیگ برای کاربر**\n\n"
+            "لطفاً **آیدی عددی کاربری** که می‌خواهید برایش کانفیگ بسازید را ارسال کنید:\n\n"
+            "برای لغو /admin را بزنید.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_menu")]])
+        )
+
+    elif data.startswith("admin_assign_srv_"):
+        server_id = data.replace("admin_assign_srv_", "")
+        context.user_data['admin_assign_server_id'] = server_id
+
+        policy = get_service_policy()
+        plans = build_vpn_plans(policy)
+        keyboard = []
+        for plan_key, plan in plans.items():
+            label = f"{plan['name']} | {plan['gb']:g} گیگ"
+            keyboard.append([InlineKeyboardButton(label, callback_data=f"admin_assign_plan_{plan_key}")])
+        keyboard.append([InlineKeyboardButton("🔙 لغو", callback_data="admin_menu")])
+
+        await query.edit_message_text("لطفاً پلن مورد نظر را برای این کاربر انتخاب کنید:",
+                                      reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data.startswith("admin_assign_plan_"):
+        plan_key = data.replace("admin_assign_plan_", "")
+        target_uid = context.user_data.get('admin_assign_target_uid')
+        server_id = context.user_data.get('admin_assign_server_id')
+
+        if not target_uid or not server_id:
+            await query.edit_message_text("❌ اطلاعات نشست منقضی شده است. لطفا دوباره تلاش کنید.",
+                                          reply_markup=InlineKeyboardMarkup(
+                                              [[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_menu")]]))
+            return
+
+        policy = get_service_policy()
+        plan = build_vpn_plans(policy).get(plan_key)
+        if not plan:
+            await query.edit_message_text("❌ پلن نامعتبر.", reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_menu")]]))
+            return
+
+        plan_gb = float(plan['gb'])
+        client_id = str(uuid.uuid4())
+        suffix = random_suffix()
+        email = f"u{target_uid}_{suffix}@vpn"
+
+        total_bytes = int(round(plan_gb * (1024 ** 3)))
+        expiry_time = policy['global_expiry_time_ms']
+
+        cid, error = create_client(server_id, email, total_bytes, expiry_time)
+        if error:
+            await query.edit_message_text(f"❌ خطا در ساخت کانفیگ: {error}", reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_menu")]]))
+            return
+
+        save_new_config(target_uid, email, cid, plan_gb, server_id=server_id)
+        vless_link = generate_vless_link(cid, email, server_id)
+
+        await query.edit_message_text(
+            f"✅ کانفیگ با موفقیت برای کاربر `{target_uid}` ساخته شد.\n\n`{vless_link}`",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_menu")]])
+        )
+
+        # Auto-notify user of the gift
+        try:
+            await context.bot.send_message(
+                chat_id=target_uid,
+                text=f"🎁 یک سرویس جدید توسط ادمین برای شما ایجاد شد!\n\nحجم: {plan_gb} گیگ\n\n🔗 لینک کانفیگ:\n`{vless_link}`",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logger.error(f"Failed to notify user {target_uid}: {e}")
+
+        context.user_data.pop('admin_assign_target_uid', None)
+        context.user_data.pop('admin_assign_server_id', None)
+    elif data == "admin_cards":
+        cards = get_all_payment_cards()
+        await query.edit_message_text("💳 مدیریت شماره کارت‌ها:", reply_markup=get_admin_cards_keyboard(cards))
+
+    elif data == "admin_card_add":
+        context.user_data['awaiting_payment_card_add'] = True
+        await query.edit_message_text(
+            "لطفاً شماره کارت و نام صاحب کارت را با فرمت `شماره‌کارت|نام` بفرستید.\n"
+            "مثال: `6037991122334455|علی محمدی`\n\n"
+            "برای لغو /admin را بزنید.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_cards")]])
+        )
+
+    elif data.startswith("admin_card_edit_"):
+        card_id = data.replace("admin_card_edit_", "")
+        await query.edit_message_text("عملیات مورد نظر روی این کارت را انتخاب کنید:",
+                                      reply_markup=get_admin_card_actions_keyboard(card_id))
+
+    elif data.startswith("admin_card_toggle_"):
+        card_id = data.replace("admin_card_toggle_", "")
+        toggle_payment_card(card_id)
+        cards = get_all_payment_cards()
+        await query.edit_message_text("✅ وضعیت کارت تغییر کرد.\n💳 مدیریت شماره کارت‌ها:",
+                                      reply_markup=get_admin_cards_keyboard(cards))
+
+    elif data.startswith("admin_card_delete_"):
+        card_id = data.replace("admin_card_delete_", "")
+        delete_payment_card(card_id)
+        cards = get_all_payment_cards()
+        await query.edit_message_text("🗑️ کارت با موفقیت حذف شد.\n💳 مدیریت شماره کارت‌ها:",
+                                      reply_markup=get_admin_cards_keyboard(cards))
 
 async def show_admin_menu(query):
     """Show the admin menu"""
@@ -964,6 +1344,178 @@ async def handle_admin_plan_callback(query, data, context: ContextTypes.DEFAULT_
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_plans")]])
         )
         return
+
+async def handle_admin_server_callback(query, data, user_id, context):
+    """Admin server management callbacks."""
+    if user_id not in ADMIN_IDS:
+        await query.answer("دسترسی رد شد.")
+        return
+
+    if data == "admin_servers":
+        await show_admin_servers(query)
+
+
+    elif data == "admin_server_add":
+
+        context.user_data['awaiting_server_create'] = True
+
+        await query.edit_message_text(
+
+            "برای افزودن سرور جدید، لطفاً یک **شناسه انگلیسی منحصر به فرد** (مثلاً `de1` یا `nl2`) برای سرور ارسال کنید:\n\n"
+
+            "پس از ثبت شناسه، می‌توانید سایر اطلاعات (آدرس، یوزرنیم، پسورد و...) را به صورت دکمه‌ای وارد کنید.\n\n"
+
+            "برای لغو /admin را بزنید.",
+
+            parse_mode="Markdown",
+
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_servers")]])
+
+        )
+
+
+    elif data.startswith("admin_server_edit_fields_"):
+
+        server_id = data.replace("admin_server_edit_fields_", "")
+
+        await query.edit_message_text(
+
+            f"چه بخشی از سرور {server_id} را میخواهید ویرایش کنید؟",
+
+            reply_markup=get_admin_server_fields_keyboard(server_id)
+
+        )
+
+
+    elif data.startswith("admin_server_setfield_"):
+
+        # Format: admin_server_setfield_{server_id}_{field}
+
+        parts = data.replace("admin_server_setfield_", "").split("_", 1)
+
+        server_id = parts[0]
+
+        field = parts[1]
+
+        context.user_data['awaiting_server_field_edit'] = {
+
+            'server_id': server_id,
+
+            'field': field
+
+        }
+
+        field_names_fa = {
+
+            'name': 'نام سرور', 'url': 'آدرس پنل (URL)', 'username': 'نام کاربری',
+
+            'password': 'رمز عبور', 'inbound_id': 'شناسه Inbound', 'host': 'Host/IP',
+
+            'port': 'پورت', 'sni': 'SNI', 'vless_text': 'متن VLESS',
+
+            'sub_port': 'پورت ساب', 'sub_path': 'مسیر ساب'
+
+        }
+
+        await query.edit_message_text(
+
+            f"لطفاً مقدار جدید برای `{field_names_fa.get(field, field)}` در سرور {server_id} را ارسال کنید:\n\n"
+
+            "برای لغو /admin را بزنید.",
+
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔙 بازگشت", callback_data=f"admin_server_edit_fields_{server_id}")]])
+
+        )
+
+    elif data.startswith("admin_server_edit_"):
+        server_id = data.replace("admin_server_edit_", "")
+        await show_admin_server_detail(query, server_id)
+
+    elif data.startswith("admin_server_toggle_type_"):
+        server_id = data.replace("admin_server_toggle_type_", "")
+        srv = get_server(server_id)
+        if srv:
+            new_type = 'manual' if srv.get('type', 'xui') == 'xui' else 'xui'
+            save_server(
+                server_id=srv['server_id'], name=srv['name'], url=srv['url'],
+                username=srv['username'], password=srv['password'], inbound_id=srv['inbound_id'],
+                host=srv.get('host', ''), port=srv.get('port', 443), sni=srv.get('sni', ''),
+                vless_text=srv.get('vless_text', ''), sub_port=srv.get('sub_port', 0),
+                sub_path=srv.get('sub_path', 'sub'), is_active=srv.get('is_active', True),
+                sort_order=srv.get('sort_order', 0), server_type=new_type
+            )
+        await show_admin_server_detail(query, server_id)
+
+    elif data.startswith("admin_server_toggle_"):
+        server_id = data.replace("admin_server_toggle_", "")
+        srv = get_server(server_id)
+        if srv:
+            toggle_server_active(server_id, not srv['is_active'])
+        await show_admin_server_detail(query, server_id)
+
+    elif data.startswith("admin_server_delete_"):
+        server_id = data.replace("admin_server_delete_", "")
+        ok, err = delete_server(server_id)
+        if ok:
+            await query.edit_message_text(
+                f"✅ سرور {server_id} حذف شد.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_servers")]])
+            )
+        else:
+            await query.edit_message_text(
+                f"❌ خطا در حذف سرور: {err}",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_servers")]])
+            )
+
+
+async def show_admin_servers(query):
+    """Show list of servers for admin."""
+    servers = get_all_servers(include_inactive=True)
+    if not servers:
+        await query.edit_message_text(
+            "هیچ سروری ثبت نشده است.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ افزودن سرور جدید", callback_data="admin_server_add")],
+                [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_menu")]
+            ])
+        )
+        return
+    await query.edit_message_text(
+        "🖥️ مدیریت سرورها:",
+        reply_markup=get_admin_servers_keyboard(servers)
+    )
+
+
+async def show_admin_server_detail(query, server_id):
+    """Show details of a single server."""
+    srv = get_server(server_id)
+    if not srv:
+        await query.edit_message_text(
+            "سرور یافت نشد.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_servers")]])
+        )
+        return
+    status_icon = "✅ فعال" if srv['is_active'] else "❌ غیرفعال"
+    server_type_str = "دستی (Manual)" if srv.get('type') == 'manual' else "اتوماتیک (X-UI)"
+    message = (
+        f"🖥️ سرور: {srv['name']}\n\n"
+        f"🆔 شناسه: {srv['server_id']}\n"
+        f"⚙️ نوع سرور: {server_type_str}\n"
+        f"🌐 URL: {srv['url']}\n"
+        f"👤 نام کاربری: {srv['username']}\n"
+        f"🔌 Inbound: {srv['inbound_id']}\n"
+        f"🏠 Host: {srv.get('host', '—')}\n"
+        f"🚪 Port: {srv.get('port', '—')}\n"
+        f"🔒 SNI: {srv.get('sni', '—')}\n"
+        f"📡 Sub Port: {srv.get('sub_port', '—')}\n"
+        f"📁 Sub Path: {srv.get('sub_path', '—')}\n"
+        f"📊 وضعیت: {status_icon}\n"
+    )
+    await query.edit_message_text(
+        message,
+        reply_markup=get_admin_server_actions_keyboard(server_id)
+    )
 
 
 async def show_service_policy(query):
@@ -1091,13 +1643,16 @@ async def show_pending_approvals(query, context: ContextTypes.DEFAULT_TYPE = Non
     keyboard = []
 
     for payment in pending_payments:
-        payment_id, user_id, plan, first_name, username, receipt_file_id, payment_type, amount, plan_key, plan_gb = payment
+        # Now 11 fields
+        (payment_id, user_id, plan, first_name, username, receipt_file_id,
+         payment_type, amount, plan_key, plan_gb, server_id) = payment
         user_display = f"{first_name} (@{username})" if username else f"{first_name} (بدون یوزرنیم)"
         payment_type_label = "شارژ کیف پول" if payment_type == 'wallet_topup' else "خرید سرویس"
         amount_text = _format_wallet_amount(amount)
         gb_text = _format_wallet_amount(plan_gb)
+        srv = get_server(server_id) if server_id else None
+        server_label = srv['name'] if srv else (server_id or "—")
 
-        # Store the file_id in context for later retrieval if context is provided
         if context:
             context.bot_data['receipt_file_ids'][str(payment_id)] = receipt_file_id
 
@@ -1105,6 +1660,7 @@ async def show_pending_approvals(query, context: ContextTypes.DEFAULT_TYPE = Non
             f"🆔 {payment_id}\n"
             f"👤 کاربر: {user_display}\n"
             f"📝 نوع: {payment_type_label}\n"
+            f"🖥️ سرور: {server_label}\n"
             f"📦 مورد: {plan}\n"
             f"📊 حجم: {gb_text} گیگ\n"
             f"💰 مبلغ: {_format_price_toman(amount)}\n\n"
@@ -1325,11 +1881,19 @@ async def send_broadcast_message(message, context):
 
     return success, failed
 
+
 async def handle_support_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle text messages for support tickets"""
+    """Handle text messages for support tickets, admin inputs, and text receipts"""
     user_id = update.effective_user.id
     message_text = update.message.text
 
+    # 1. Catch Text Receipts (Transaction IDs or payment links)
+    if context.user_data.get('awaiting_wallet_topup_receipt') or (
+            context.user_data.get('awaiting_direct_receipt') and context.user_data.get('pending_order')):
+        await process_receipt_submission(update, context, text_data=message_text)
+        return
+
+    # 2. Existing topup amount logic
     if context.user_data.get('awaiting_wallet_topup_amount'):
         try:
             wallet_amount = float(message_text.strip())
@@ -1344,10 +1908,281 @@ async def handle_support_message(update: Update, context: ContextTypes.DEFAULT_T
         context.user_data['awaiting_wallet_topup_receipt'] = True
         await update.message.reply_text(
             f"مبلغ {_format_wallet_amount(wallet_amount)} ثبت شد.\n"
-            "اکنون فیش پرداخت را ارسال کنید."
+            "اکنون تصویر فیش پرداخت یا شماره پیگیری/رسید متنی را ارسال کنید.\n"
+            f"{get_payment_msg(get_active_payment_cards())}"
         )
         return
 
+    # Admin providing manual config for manual servers
+    if user_id in ADMIN_IDS and context.user_data.get('awaiting_manual_config'):
+        manual_data = context.user_data['awaiting_manual_config']
+        config_text = message_text.strip()
+
+        p_record = manual_data['payment_record']
+        payment_id = manual_data['payment_id']
+        target_user_id = p_record['user_id']
+        plan_gb = float(p_record['plan_gb'] or _parse_plan_gb(p_record['plan']))
+        server_id = manual_data['srv']['server_id']
+        is_extension = p_record['payment_type'] == 'extension'
+
+        update_payment_status(payment_id, 'approved')
+
+        if is_extension:
+            email = p_record['target_email']
+            update_config_total_gb(email, target_user_id, plan_gb)
+            try:
+                await context.bot.send_message(
+                    chat_id=target_user_id,
+                    text=f"✅ درخواست تمدید شما تأیید شد!\n\nاطلاعات سرویس:\n{config_text}",
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                logger.error(e)
+        else:
+            client_id = str(uuid.uuid4())
+            suffix = random_suffix()
+            user_identifier = p_record['username'] if p_record['username'] else str(target_user_id)
+            email = f"{user_identifier}_{suffix}@manual"
+            save_new_config(target_user_id, email, client_id, plan_gb, server_id=server_id)
+
+            # Check referral
+            amount = float(p_record['amount'] or 0)
+            if amount > 0:
+                referral_applied, referrer_user_id, commission_amount = credit_referral_bonus_if_first_service_purchase(
+                    target_user_id, amount)
+                if referral_applied and referrer_user_id:
+                    try:
+                        await context.bot.send_message(chat_id=referrer_user_id,
+                                                       text=f"🎉 دعوت شما باعث اولین خرید یک عضو جدید شد.\n{_format_price_toman(commission_amount)} به کیف پول شما اضافه شد.")
+                    except Exception:
+                        pass
+
+            try:
+                await context.bot.send_message(
+                    chat_id=target_user_id,
+                    text=f"✅ پرداخت شما تأیید شد!\n\nسرویس شما:\n`{config_text}`",
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                logger.error(e)
+
+        await update.message.reply_text(
+            f"✅ کانفیگ دستی برای کاربر `{target_user_id}` ارسال شد و پرداخت تأیید گردید.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔙 بازگشت به لیست", callback_data="admin_pending")]])
+        )
+        del context.user_data['awaiting_manual_config']
+        return
+    # Admin send message to specific user flow
+    if user_id in ADMIN_IDS and context.user_data.get('awaiting_admin_msg_user'):
+        try:
+            # We use split('|', 1) so if the message itself contains '|', it won't break
+            parts = message_text.strip().split('|', 1)
+            if len(parts) != 2:
+                raise ValueError("فرمت اشتباه است")
+
+            target_user_id = int(parts[0].strip())
+            msg_content = parts[1].strip()
+
+            # Try to send the message to the user
+            await context.bot.send_message(
+                chat_id=target_user_id,
+                text=f"✉️ **پیام از طرف مدیریت:**\n\n{msg_content}",
+                parse_mode="Markdown"
+            )
+
+            # Confirm success to the admin
+            await update.message.reply_text(
+                f"✅ پیام با موفقیت به کاربر `{target_user_id}` ارسال شد.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("بازگشت به پنل", callback_data="admin_menu")]])
+            )
+
+        except ValueError:
+            await update.message.reply_text(
+                "❌ فرمت نامعتبر. لطفاً دقیقاً به صورت `user_id|متن پیام` ارسال کنید.",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logger.error(f"Failed to send message to user {target_user_id}: {e}")
+            await update.message.reply_text(
+                f"❌ خطا در ارسال پیام. ممکن است کاربر ربات را مسدود (Block) کرده باشد یا آیدی اشتباه باشد.\nخطا: `{str(e)}`",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("بازگشت به پنل", callback_data="admin_menu")]])
+            )
+
+        del context.user_data['awaiting_admin_msg_user']
+        return
+    # Admin Add Payment Card Flow
+    if user_id in ADMIN_IDS and context.user_data.get('awaiting_payment_card_add'):
+        try:
+            parts = message_text.strip().split('|')
+            if len(parts) != 2:
+                raise ValueError
+            add_payment_card(parts[0].strip(), parts[1].strip())
+            del context.user_data['awaiting_payment_card_add']
+            await update.message.reply_text("✅ شماره کارت با موفقیت اضافه شد.", reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("بازگشت به کارت‌ها", callback_data="admin_cards")]]))
+        except ValueError:
+            await update.message.reply_text("❌ فرمت نامعتبر. لطفاً دقیقاً به صورت `شماره‌کارت|نام` ارسال کنید.",
+                                            parse_mode="Markdown")
+        return
+    # Admin server create flow
+    if user_id in ADMIN_IDS and context.user_data.get('awaiting_server_create'):
+        server_id = message_text.strip()
+
+        # Basic validation for English ID without spaces
+        if " " in server_id or "|" in server_id:
+            await update.message.reply_text("شناسه نامعتبر است. از فاصله یا کاراکترهای غیرمجاز استفاده نکنید.")
+            return
+
+        # Check if server ID already exists
+        if get_server(server_id):
+            await update.message.reply_text("این شناسه از قبل وجود دارد. لطفاً شناسه دیگری ارسال کنید.")
+            return
+
+        # Save placeholder stub for the server
+        save_server(
+            server_id=server_id,
+            name=f"Server {server_id}",
+            url="http://panel.example.com",
+            username="admin",
+            password="password",
+            inbound_id=1,
+            host="",
+            port=443,
+            sni="",
+            vless_text="",
+            sub_port=0,
+            sub_path="sub",
+            is_active=False  # Keep inactive until admin finishes setting it up
+        )
+        del context.user_data['awaiting_server_create']
+
+        await update.message.reply_text(
+            f"✅ سرور موقت با شناسه `{server_id}` ایجاد شد.\n\n"
+            "لطفاً اکنون اطلاعات اصلی سرور (آدرس پنل، نام کاربری، رمز و...) را از طریق دکمه زیر تکمیل کنید:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("ویرایش اطلاعات سرور",
+                                      callback_data=f"admin_server_edit_fields_{server_id}")],
+                [InlineKeyboardButton("بازگشت به لیست سرورها", callback_data="admin_servers")]
+            ])
+        )
+        return
+
+    if user_id in ADMIN_IDS and context.user_data.get('awaiting_server_field_edit'):
+        edit_info = context.user_data['awaiting_server_field_edit']
+        server_id = edit_info['server_id']
+        field = edit_info['field']
+        new_value_text = message_text.strip()
+
+        srv = get_server(server_id)
+        if not srv:
+            await update.message.reply_text("خطا: سرور یافت نشد.")
+            del context.user_data['awaiting_server_field_edit']
+            return
+
+        # Convert numeric types if necessary
+        new_val = new_value_text
+        try:
+            if field in ['inbound_id', 'port', 'sub_port']:
+                new_val = int(new_value_text)
+        except ValueError:
+            await update.message.reply_text("خطا: این فیلد باید عدد باشد.")
+            return
+
+        # Update the specific field
+        srv[field] = new_val
+
+        # Save back to database
+        save_server(
+            server_id=srv['server_id'],
+            name=srv['name'],
+            url=srv['url'],
+            username=srv['username'],
+            password=srv['password'],
+            inbound_id=srv['inbound_id'],
+            host=srv.get('host', ''),
+            port=srv.get('port', 443),
+            sni=srv.get('sni', ''),
+            vless_text=srv.get('vless_text', ''),
+            sub_port=srv.get('sub_port', 0),
+            sub_path=srv.get('sub_path', 'sub'),
+            is_active=srv.get('is_active', True),
+            sort_order=srv.get('sort_order', 0)
+        )
+
+        del context.user_data['awaiting_server_field_edit']
+        await update.message.reply_text(
+            f"✅ مقدار فیلد `{field}` در سرور {server_id} با موفقیت به‌روزرسانی شد.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("مشاهده سرور", callback_data=f"admin_server_edit_{server_id}")]])
+        )
+        return
+
+    # Admin charge wallet flow
+    if user_id in ADMIN_IDS and context.user_data.get('awaiting_user_wallet_charge'):
+        try:
+            parts = message_text.strip().split('|')
+            if len(parts) != 2:
+                raise ValueError("فرمت اشتباه است")
+            target_user_id = int(parts[0].strip())
+            amount = float(parts[1].strip())
+
+            success, new_balance = adjust_wallet_balance(target_user_id, amount)
+            if success:
+                await update.message.reply_text(
+                    f"✅ کیف پول کاربر `{target_user_id}` با موفقیت مبلغ `{_format_wallet_amount(amount)}` شارژ شد.\nموجودی جدید: `{_format_wallet_amount(new_balance)}`",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("بازگشت به پنل", callback_data="admin_menu")]])
+                )
+                try:
+                    await context.bot.send_message(
+                        chat_id=target_user_id,
+                        text=f"💰 کیف پول شما از طرف ادمین مبلغ {_format_wallet_amount(amount)} شارژ شد.\nموجودی فعلی: {_format_wallet_amount(new_balance)}"
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to notify user {target_user_id} about wallet charge: {e}")
+            else:
+                await update.message.reply_text("❌ خطا در شارژ کیف پول. (احتمالاً کاربر در دیتابیس وجود ندارد)")
+        except Exception as e:
+            await update.message.reply_text("❌ فرمت نامعتبر. لطفاً دقیقاً به صورت `user_id|amount` ارسال کنید.",
+                                            parse_mode="Markdown")
+
+        del context.user_data['awaiting_user_wallet_charge']
+        return
+
+    # Admin assign config flow (Target User ID Step)
+    if user_id in ADMIN_IDS and context.user_data.get('awaiting_admin_assign_userid'):
+        target_uid = message_text.strip()
+        if not target_uid.isdigit():
+            await update.message.reply_text("❌ آیدی باید عدد باشد.")
+            return
+
+        context.user_data['admin_assign_target_uid'] = int(target_uid)
+        del context.user_data['awaiting_admin_assign_userid']
+
+        servers = get_active_servers()
+        if not servers:
+            await update.message.reply_text("هیچ سرور فعالی یافت نشد.")
+            return
+
+        keyboard = []
+        for srv in servers:
+            keyboard.append([InlineKeyboardButton(f"🌍 {srv[1]}", callback_data=f"admin_assign_srv_{srv[0]}")])
+        keyboard.append([InlineKeyboardButton("🔙 لغو", callback_data="admin_menu")])
+
+        await update.message.reply_text(
+            f"کاربر `{target_uid}` انتخاب شد.\nلطفاً سروری که می‌خواهید کانفیگ روی آن ساخته شود را انتخاب کنید:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
     if user_id in ADMIN_IDS and context.user_data.get("awaiting_service_policy_max_gb"):
         try:
             max_config_gb = float(message_text.strip())
@@ -1674,11 +2509,11 @@ async def handle_admin_decision(query, data, user_id, context: ContextTypes.DEFA
         await reject_payment(query, payment_id, context)
 
 async def approve_payment(query, payment_id, context: ContextTypes.DEFAULT_TYPE):
-    """Approve a payment and create VPN configuration for the user or extend existing one"""
+    """Approve a payment and create/extend VPN configuration on the correct server."""
     payment_record = get_payment_record(payment_id)
 
     if not payment_record or payment_record['status'] != 'pending':
-        await query.answer("پرداخت یافت نشد یا قبلاً پردازش ��ده است.")
+        await query.answer("پرداخت یافت نشد یا قبلاً پردازش شده است.")
         return
 
     user_id = payment_record['user_id']
@@ -1690,6 +2525,13 @@ async def approve_payment(query, payment_id, context: ContextTypes.DEFAULT_TYPE)
     if plan_gb <= 0:
         plan_gb = _parse_plan_gb(plan_name)
     policy = get_service_policy()
+
+    # Resolve server_id
+    server_id = payment_record['server_id'] if 'server_id' in payment_record.keys() else None
+    if not server_id:
+        # Fall back to first active server
+        servers = get_active_servers()
+        server_id = servers[0][0] if servers else None
 
     if payment_type == 'wallet_topup':
         success, new_balance = adjust_wallet_balance(user_id, payment_amount)
@@ -1717,6 +2559,30 @@ async def approve_payment(query, payment_id, context: ContextTypes.DEFAULT_TYPE)
         )
         return
 
+    if not server_id:
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=f"❌ هیچ سروری برای پردازش این پرداخت یافت نشد.",
+        )
+        return
+    srv = get_server(server_id)
+    is_manual = srv and srv.get('type') == 'manual'
+
+    if is_manual:
+        context.user_data['awaiting_manual_config'] = {
+            'payment_id': payment_id,
+            'payment_record': dict(payment_record),
+            'srv': srv
+        }
+        await query.edit_message_text(
+            f"⚙️ **این پرداخت مربوط به یک سرور دستی (Manual) است.**\n\n"
+            f"لطفاً لینک کانفیگ، سابسکریپشن یا پیام تمدید را برای ارسال به کاربر وارد کنید:\n\n"
+            f"*(پرداخت تا زمان ارسال پیام توسط شما تکمیل نخواهد شد)*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو ارسال", callback_data="admin_pending")]])
+        )
+        return
+
     is_extension = payment_type == 'extension'
     extension_email = payment_record['target_email']
     extension_client_id = payment_record['target_client_id']
@@ -1726,89 +2592,66 @@ async def approve_payment(query, payment_id, context: ContextTypes.DEFAULT_TYPE)
             raise Exception("اطلاعات سرویس برای تمدید ناقص است")
 
         if is_extension:
-            # Handle extension of existing service
-
-            # Get current status to obtain expiry date
-            status = get_client_status(extension_email)
+            status = get_client_status(server_id, extension_email)
             if not status:
                 raise Exception("خطا در دریافت اطلاعات سرویس فعلی")
 
             if policy['max_config_gb'] > 0 and status['total_gb'] + plan_gb > policy['max_config_gb']:
                 raise Exception(f"تمدید از محدودیت {policy['max_config_gb']} گیگابایت بیشتر می‌شود")
 
-            # Extend the client service
-            success, error_msg = extend_client(extension_email, extension_client_id, plan_gb, policy['global_expiry_time_ms'])
-
+            success, error_msg = extend_client(
+                server_id, extension_email, extension_client_id, plan_gb, policy['global_expiry_time_ms']
+            )
             if not success:
                 raise Exception(f"خطا در تمدید سرویس: {error_msg}")
 
-            # Update the database with the new total GB amount
-            db_update_success = update_config_total_gb(extension_email, user_id, plan_gb)
-            if not db_update_success:
-                logger.warning(f"Failed to update database for config {extension_email} after extension")
+            if not update_config_total_gb(extension_email, user_id, plan_gb):
+                logger.warning(f"Failed to update database for config {extension_email}")
 
-            # Update payment status to approved
             update_payment_status(payment_id, 'approved')
 
-            # Generate VLESS link
-            vless_link = generate_vless_link(extension_client_id, extension_email)
-            sub_link = generate_sub_link(status['subId'])
-            # Notify the user about their approved extension
+            vless_link = generate_vless_link(extension_client_id, extension_email, server_id)
+            sub_link = generate_sub_link(status['subId'], server_id)
+
             await context.bot.send_message(
                 chat_id=user_id,
                 text=f"✅ درخواست تمدید شما تأیید شد!\n\n"
-                     f"حجم {plan_gb} گیگابایت به سرویس شما اضافه شد\n"
-                     f"تاریخ انقضا به تاریخ سراسری تنظیم شد\n\n"
-                     f"🔗 لینک کانفیگ شما:\n`{vless_link}`"
+                     f"حجم {plan_gb} گیگابایت به سرویس شما اضافه شد\n\n"
+                     f"🔗 لینک کانفیگ شما:\n`{vless_link}`\n"
                      f"🔗 لینک سابسکریپشن شما:\n`{sub_link}`",
-
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(get_back_to_main_button())
             )
 
-            # Confirm successful approval to admin
             await context.bot.send_message(
                 chat_id=query.message.chat_id,
                 text=f"تمدید سرویس {extension_email} با {plan_gb} گیگابایت تأیید شد."
             )
         else:
-            # Handle new service creation (existing logic)
             if policy['max_config_gb'] > 0 and plan_gb > policy['max_config_gb']:
                 raise Exception(f"پلن از محدودیت {policy['max_config_gb']} گیگابایت بیشتر است")
 
-            # Create unique identifiers for the new client
             client_id = str(uuid.uuid4())
             suffix = random_suffix()
-
-            # Create email identifier for the client
             user_identifier = username if username else str(user_id)
             email = f"{user_identifier}_{suffix}@vpn"
-
-            # Ensure email is not too long
             if len(email) > 50:
                 email = f"u{user_id}_{suffix}@vpn"
 
-            # Calculate configuration details
-            total_bytes = int(round(plan_gb * (1024 ** 3)))  # Convert GB to bytes
+            total_bytes = int(round(plan_gb * (1024 ** 3)))
             expiry_time = policy['global_expiry_time_ms']
 
-            # Create the client on the VPN server
-            client_id, error = create_client(email, total_bytes, expiry_time)
-
+            client_id, error = create_client(server_id, email, total_bytes, expiry_time)
             if error:
                 raise Exception(f"خطا در ایجاد کانفیگ: {error}")
 
-            # Save the new configuration in the database
-            save_new_config(user_id, email, client_id, plan_gb)
-            referral_applied, referrer_user_id, commission_amount = credit_referral_bonus_if_first_service_purchase(user_id, payment_amount)
+            save_new_config(user_id, email, client_id, plan_gb, server_id=server_id)
+            referral_applied, referrer_user_id, commission_amount = \
+                credit_referral_bonus_if_first_service_purchase(user_id, payment_amount)
 
-            # Update payment status to approved
             update_payment_status(payment_id, 'approved')
+            vless_link = generate_vless_link(client_id, email, server_id)
 
-            # Generate VPN connection link
-            vless_link = generate_vless_link(client_id, email)
-
-            # Notify the user about their approved payment and send config
             await context.bot.send_message(
                 chat_id=user_id,
                 text=f"✅ پرداخت شما تأیید شد!\n\n"
@@ -1829,7 +2672,6 @@ async def approve_payment(query, payment_id, context: ContextTypes.DEFAULT_TYPE)
                 except Exception:
                     logger.exception("Failed to notify referrer %s", referrer_user_id)
 
-            # Confirm successful approval to admin
             await context.bot.send_message(
                 chat_id=query.message.chat_id,
                 text=f"پرداخت {payment_id} تأیید شد و کانفیگ برای کاربر ارسال شد."
@@ -1837,7 +2679,6 @@ async def approve_payment(query, payment_id, context: ContextTypes.DEFAULT_TYPE)
 
     except Exception as e:
         logger.error(f"Error approving payment: {str(e)}")
-        # Notify admin about the error
         await context.bot.send_message(
             chat_id=query.message.chat_id,
             text=f"خطا در پردازش پرداخت: {str(e)}",
@@ -1921,8 +2762,9 @@ async def reject_payment(query, payment_id, context: ContextTypes.DEFAULT_TYPE):
             text=f"خطا در رد پرداخت {payment_id}: {str(e)}",
             reply_markup=get_admin_menu_keyboard(),
         )
+
 async def handle_view_receipt(query, data, user_id, context: ContextTypes.DEFAULT_TYPE):
-    """Handle the view receipt button click to show the receipt image to admin"""
+    """Handle the view receipt button click to show the receipt image or text to admin"""
     if user_id not in ADMIN_IDS:
         await query.answer("دسترسی رد شد.")
         return
@@ -1945,16 +2787,27 @@ async def handle_view_receipt(query, data, user_id, context: ContextTypes.DEFAUL
 
         file_id = result[0]
 
-        # Send the receipt image
-        await context.bot.send_photo(
-            chat_id=user_id,
-            photo=file_id,
-            caption=f"🧾 رسید پرداخت #{payment_id}",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ تأیید", callback_data=f"approve_{payment_id}")],
-                [InlineKeyboardButton("❌ رد", callback_data=f"reject_{payment_id}")]
-            ])
-        )
+        if file_id.startswith("text:"):
+            text_content = file_id[5:]
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"🧾 متن رسید پرداختی #{payment_id}:\n\n{text_content}",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ تأیید", callback_data=f"approve_{payment_id}")],
+                    [InlineKeyboardButton("❌ رد", callback_data=f"reject_{payment_id}")]
+                ])
+            )
+        else:
+            # Send the receipt image
+            await context.bot.send_photo(
+                chat_id=user_id,
+                photo=file_id,
+                caption=f"🧾 رسید پرداخت #{payment_id}",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ تأیید", callback_data=f"approve_{payment_id}")],
+                    [InlineKeyboardButton("❌ رد", callback_data=f"reject_{payment_id}")]
+                ])
+            )
 
         # Inform admin that the receipt is sent
         await query.answer("رسید برای شما ارسال شد.")
@@ -2008,24 +2861,35 @@ async def show_extend_options(query, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle_extend_selection(query, data, user_id, context: ContextTypes.DEFAULT_TYPE):
-    """Handle the selection of an extension amount"""
+    """Handle the selection of an extension amount."""
     policy = get_service_policy()
     plan_key = data[len("extend_plan_"):]
     selected_plan = build_vpn_plans(policy).get(plan_key)
     if not selected_plan:
-        await query.edit_message_text("پلن نامعتبر است.", reply_markup=InlineKeyboardMarkup(get_back_to_main_button()))
+        await query.edit_message_text("پلن نامعتبر است.",
+                                      reply_markup=InlineKeyboardMarkup(get_back_to_main_button()))
         return
 
     gb_amount = float(selected_plan.get('gb', 0))
 
+    if 'extending_email' not in context.user_data:
+        await query.edit_message_text("خطا در بازیابی اطلاعات کانفیگ.",
+                                      reply_markup=InlineKeyboardMarkup(get_back_to_main_button()))
+        return
+
+    email = context.user_data['extending_email'].strip()
+    server_id = get_server_for_config(email, user_id)
+    if not server_id:
+        await query.edit_message_text("سرور مربوطه یافت نشد.",
+                                      reply_markup=InlineKeyboardMarkup(get_back_to_main_button()))
+        return
+
     if policy['max_config_gb'] > 0:
         current_total_gb = None
-
         for config in get_user_configs(user_id):
-            if config[1] == context.user_data.get('extending_email'):
+            if config[1] == email:
                 current_total_gb = float(config[3])
                 break
-
         if current_total_gb is not None and current_total_gb + gb_amount > policy['max_config_gb']:
             reply_markup = InlineKeyboardMarkup(get_back_to_main_button())
             await query.edit_message_text(
@@ -2034,25 +2898,19 @@ async def handle_extend_selection(query, data, user_id, context: ContextTypes.DE
             )
             return
 
-    # Check if we have the email in context
-    if 'extending_email' not in context.user_data:
-        await query.edit_message_text("خطا در بازیابی اطلاعات کانفیگ.", reply_markup=InlineKeyboardMarkup(get_back_to_main_button()))
-        return
-
-    email = context.user_data['extending_email']
-    email = email.strip()
-
-    # Get client_id for the email
     client_id = get_client_id_by_email(email, user_id)
     if not client_id:
-        await query.edit_message_text("خطا در بازیابی اطلاعات کانفیگ.", reply_markup=InlineKeyboardMarkup(get_back_to_main_button()))
+        await query.edit_message_text("خطا در بازیابی اطلاعات کانفیگ.",
+                                      reply_markup=InlineKeyboardMarkup(get_back_to_main_button()))
         return
 
-    order = _build_order('extension', f"تمدید {gb_amount:g}GB", gb_amount, selected_plan['price'], f"status_{email}", email=email, client_id=client_id, plan_key=plan_key)
+    order = _build_order(
+        'extension', f"تمدید {gb_amount:g}GB", gb_amount,
+        selected_plan['price'], f"status_{email}",
+        email=email, client_id=client_id, plan_key=plan_key, server_id=server_id
+    )
     await prompt_payment_method(query, context, order)
-
-    # Log the extension request
-    logger.info(f"User {user_id} requested extension for {email} by {gb_amount}GB")
+    logger.info(f"User {user_id} requested extension for {email} on {server_id} by {gb_amount}GB")
 
 async def set_bot_commands(application):
     await application.bot.set_my_commands([
@@ -2068,6 +2926,20 @@ async def set_chat_menu_button(application):
         menu_button=MenuButtonCommands()
     )
 
+async def handle_server_selection(query, data, user_id, context):
+    """Store the user's server choice and proceed to plans or gift."""
+    server_id = data.removeprefix("select_server_")
+    srv = get_server(server_id)
+    if not srv:
+        await query.edit_message_text("سرور نامعتبر است.", reply_markup=InlineKeyboardMarkup(get_back_to_main_button()))
+        return
+
+    context.user_data['selected_server_id'] = server_id
+    flow = context.user_data.get('server_flow', 'buy')
+    if flow == 'gift':
+        await handle_buy_service_gift(query, user_id, context)
+    else:
+        await handle_buy_service(query, user_id, context)
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     """Log uncaught bot errors with update context."""
@@ -2075,14 +2947,17 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     """Main function to start the bot"""
-    # Initialize database
     init_db()
 
-    # Create application
-    # application = ApplicationBuilder().token(BOT_TOKEN).build()
-    application = ApplicationBuilder().token(BOT_TOKEN).post_init(set_bot_commands).post_init(set_chat_menu_button).build()
+    application = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .post_init(set_bot_commands)
+        .post_init(set_chat_menu_button)
+        .build()
+    )
 
-    # Add handlers
+    # ---- Command handlers ----
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("referral", referral_command))
     application.add_handler(CommandHandler("wallet", wallet_command))
@@ -2090,20 +2965,48 @@ def main():
     application.add_handler(CommandHandler("broadcast", broadcast_command))
     application.add_handler(CommandHandler("support", support_command))
 
+    # ---- Assign flow: Callback handlers (specific ones first) ----
+    application.add_handler(CallbackQueryHandler(
+        lambda u, c: start_assign_client(
+            u.callback_query,
+            u.callback_query.data.replace("admin_assign_client_", ""),
+            c,
+        ),
+        pattern=r"^admin_assign_client_",
+    ))
+
+    application.add_handler(CallbackQueryHandler(
+        lambda u, c: pick_assign_user(
+            u.callback_query,
+            u.callback_query.data.replace("admin_assign_pick_", "").rsplit("_", 1)[0],
+            int(u.callback_query.data.replace("admin_assign_pick_", "").rsplit("_", 1)[1]),
+            c,
+        ),
+        pattern=r"^admin_assign_pick_",
+    ))
+
+    # ---- Main callback dispatcher (must come AFTER specific ones above) ----
     application.add_handler(CallbackQueryHandler(callback_handler))
 
+    # ---- Media / text ----
     application.add_handler(MessageHandler(filters.PHOTO, handle_receipt))
-    # Add handler for text messages to process support tickets
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_support_message))
+
+    # Single text handler: dispatches internally to assign-flow or support flow
+    async def _text_router(update, context):
+        if context.user_data.get("assign_client_id"):
+            return await handle_assign_client_message(update, context)
+        return await handle_support_message(update, context)
+
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _text_router))
+
     application.add_error_handler(error_handler)
 
-    # Start the notification service
     logger.info("Starting notification service...")
     start_notification_service(application)
 
-    # Start the Bot
     logger.info("Bot started successfully!")
     application.run_polling()
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()

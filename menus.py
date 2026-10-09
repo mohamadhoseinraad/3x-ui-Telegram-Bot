@@ -57,9 +57,9 @@ def _format_price_toman(amount):
 
 # Free trial plans
 def get_free_trial_keyboard():
-    return [
-        [InlineKeyboardButton("درحال حاضر فعال نمیباشد", callback_data="back_to_main")],
-    ]
+    # return [
+    #     [InlineKeyboardButton("درحال حاضر فعال نمیباشد", callback_data="back_to_main")],
+    # ]
     return [
         [InlineKeyboardButton("🎁 دریافت 1GB رایگان تست یک روزه(تنها یکبار)", callback_data="free_1gb")],
         [InlineKeyboardButton("🎁 دریافت 5GB رایگان تست یک هفته ای (تنها یکبار)", callback_data="free_5gb")]
@@ -166,26 +166,123 @@ def get_admin_menu_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 درخواست‌های در انتظار", callback_data="admin_pending")],
         [InlineKeyboardButton("👥 مشاهده کاربران", callback_data="admin_users")],
+        [InlineKeyboardButton("💰 شارژ کیف پول کاربر", callback_data="admin_charge_wallet"),
+         InlineKeyboardButton("➕ ایجاد کانفیگ کاربر", callback_data="admin_assign_config")],
+        [InlineKeyboardButton("💳 مدیریت شماره کارت‌ها", callback_data="admin_cards")],
         [InlineKeyboardButton("🎫 تیکت‌های پشتیبانی", callback_data="admin_tickets")],
+        [InlineKeyboardButton("✉️ پیام به یک کاربر", callback_data="admin_msg_user")],
         [InlineKeyboardButton("👨‍💻 مدیریت کلاینت ها", callback_data="admin_manage_clients")],
         [InlineKeyboardButton("📢 ارسال پیام به همه", callback_data="admin_broadcast")],
+        [InlineKeyboardButton("🖥️ مدیریت سرورها", callback_data="admin_servers")],
         [InlineKeyboardButton("📜 Service Policy", callback_data="admin_service_policy")],
             [InlineKeyboardButton("🛠️ مدیریت پلن‌ها", callback_data="admin_plans")],
         [InlineKeyboardButton("⏱️ تنظیم تاریخ انقضای همه کلاینت‌ها", callback_data="admin_extend_all")],
         [InlineKeyboardButton("فعال/غیر فعال سازی فروش", callback_data="admin_buy_allow")]
     ])
 
-def get_extend_all_client_day():
+def get_extend_all_client_day(server_id):
+    """Keyboard for selecting days to extend configs on a specific server."""
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("1 روز افزایش تاریخ انقضا", callback_data="admin_extend_all_1")],
-        [InlineKeyboardButton("3 روز افزایش تاریخ انقضا", callback_data="admin_extend_all_3")],
-        [InlineKeyboardButton("10 روز افزایش تاریخ انقضا", callback_data="admin_extend_all_10")],
+        [InlineKeyboardButton("1 روز افزایش تاریخ انقضا", callback_data=f"admin_ext_days_{server_id}_1")],
+        [InlineKeyboardButton("3 روز افزایش تاریخ انقضا", callback_data=f"admin_ext_days_{server_id}_3")],
+        [InlineKeyboardButton("10 روز افزایش تاریخ انقضا", callback_data=f"admin_ext_days_{server_id}_10")],
         [InlineKeyboardButton("برگشت", callback_data="admin_menu")]
     ])
+
+def get_admin_server_fields_keyboard(server_id):
+    """Keyboard for selecting which specific server field to edit."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("نام سرور (Name)", callback_data=f"admin_server_setfield_{server_id}_name")],
+        [InlineKeyboardButton("نوع سرور (XUI / Manual)", callback_data=f"admin_server_toggle_type_{server_id}")],
+        [InlineKeyboardButton("آدرس پنل (URL)", callback_data=f"admin_server_setfield_{server_id}_url")],
+        [InlineKeyboardButton("نام کاربری (Username)", callback_data=f"admin_server_setfield_{server_id}_username"),
+         InlineKeyboardButton("رمز عبور (Password)", callback_data=f"admin_server_setfield_{server_id}_password")],
+        [InlineKeyboardButton("شناسه Inbound", callback_data=f"admin_server_setfield_{server_id}_inbound_id")],
+        [InlineKeyboardButton("Host/IP", callback_data=f"admin_server_setfield_{server_id}_host"),
+         InlineKeyboardButton("پورت (Port)", callback_data=f"admin_server_setfield_{server_id}_port")],
+        [InlineKeyboardButton("SNI", callback_data=f"admin_server_setfield_{server_id}_sni"),
+         InlineKeyboardButton("متن VLESS", callback_data=f"admin_server_setfield_{server_id}_vless_text")],
+        [InlineKeyboardButton("پورت ساب (Sub Port)", callback_data=f"admin_server_setfield_{server_id}_sub_port"),
+         InlineKeyboardButton("مسیر ساب (Sub Path)", callback_data=f"admin_server_setfield_{server_id}_sub_path")],
+        [InlineKeyboardButton("🔙 بازگشت به جزئیات سرور", callback_data=f"admin_server_edit_{server_id}")]
+    ])
+
+def get_admin_extend_server_keyboard(servers):
+    """Keyboard to select which server's clients should be extended."""
+    keyboard = []
+    for srv in servers:
+        keyboard.append([
+            InlineKeyboardButton(f"🌍 {srv['name']} ({srv['server_id']})", callback_data=f"admin_ext_srv_{srv['server_id']}")
+        ])
+    keyboard.append([InlineKeyboardButton("🌐 اعمال روی همه سرورها", callback_data="admin_ext_srv_all")])
+    keyboard.append([InlineKeyboardButton("🔙 بازگشت", callback_data="admin_menu")])
+    return InlineKeyboardMarkup(keyboard)
+
 def get_buy_allow_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("بله", callback_data="admin_buy_allow_yes")],
         [InlineKeyboardButton("خیر", callback_data="admin_buy_allow_no")],
         [InlineKeyboardButton("برگشت", callback_data="admin_menu")],
 
+    ])
+# ============================================================
+# MULTI-SERVER MENUS
+# ============================================================
+
+def get_server_selection_keyboard(servers, back_callback="back_to_main"):
+    """
+    Build a keyboard for choosing a server.
+    servers: list of dicts with 'server_id' and 'name'
+    """
+    keyboard = []
+    for srv in servers:
+        keyboard.append([
+            InlineKeyboardButton(
+                f"🌍 {srv['name']}",
+                callback_data=f"select_server_{srv['server_id']}"
+            )
+        ])
+    keyboard.append([InlineKeyboardButton("🔙 بازگشت", callback_data=back_callback)])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def get_admin_servers_keyboard(servers):
+    """Admin server management keyboard."""
+    keyboard = []
+    for srv in servers:
+        status_icon = "✅" if srv.get('is_active') else "❌"
+        keyboard.append([
+            InlineKeyboardButton(
+                f"{status_icon} {srv['name']} ({srv['server_id']})",
+                callback_data=f"admin_server_edit_{srv['server_id']}"
+            )
+        ])
+    keyboard.append([InlineKeyboardButton("➕ افزودن سرور جدید", callback_data="admin_server_add")])
+    keyboard.append([InlineKeyboardButton("🔙 بازگشت", callback_data="admin_menu")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def get_admin_server_actions_keyboard(server_id):
+    """Actions for a single server in admin view."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ ویرایش", callback_data=f"admin_server_edit_fields_{server_id}")],
+        [InlineKeyboardButton("🔄 فعال/غیرفعال", callback_data=f"admin_server_toggle_{server_id}")],
+        [InlineKeyboardButton("🗑️ حذف", callback_data=f"admin_server_delete_{server_id}")],
+        [InlineKeyboardButton("🔙 بازگشت به لیست", callback_data="admin_servers")],
+    ])
+
+def get_admin_cards_keyboard(cards):
+    keyboard = []
+    for card in cards:
+        status = "✅" if card['is_active'] else "❌"
+        keyboard.append([InlineKeyboardButton(f"{status} {card['card_number']} ({card['owner_name']})", callback_data=f"admin_card_edit_{card['card_id']}")])
+    keyboard.append([InlineKeyboardButton("➕ افزودن شماره کارت", callback_data="admin_card_add")])
+    keyboard.append([InlineKeyboardButton("🔙 بازگشت", callback_data="admin_menu")])
+    return InlineKeyboardMarkup(keyboard)
+
+def get_admin_card_actions_keyboard(card_id):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 فعال/غیرفعال کردن", callback_data=f"admin_card_toggle_{card_id}")],
+        [InlineKeyboardButton("🗑️ حذف کارت", callback_data=f"admin_card_delete_{card_id}")],
+        [InlineKeyboardButton("🔙 بازگشت به لیست", callback_data="admin_cards")]
     ])

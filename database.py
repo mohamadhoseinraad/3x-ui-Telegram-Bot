@@ -93,6 +93,48 @@ def init_db():
     )
     ''')
 
+    # ============================================================
+    # MULTI-SERVER SUPPORT
+    # ============================================================
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS servers (
+            server_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            url TEXT NOT NULL,
+            username TEXT NOT NULL,
+            password TEXT NOT NULL,
+            inbound_id INTEGER NOT NULL DEFAULT 1,
+            host TEXT,
+            port INTEGER DEFAULT 443,
+            sni TEXT,
+            vless_text TEXT,
+            sub_port INTEGER DEFAULT 0,
+            sub_path TEXT DEFAULT 'sub',
+            is_active BOOLEAN DEFAULT TRUE,
+            sort_order INTEGER DEFAULT 0,
+            type TEXT DEFAULT 'xui',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        ''')
+
+    # Migration for existing servers
+    cursor.execute("PRAGMA table_info(servers)")
+    server_columns = [column_info[1] for column_info in cursor.fetchall()]
+    if 'type' not in server_columns:
+        logger.info("Adding type column to servers table")
+        cursor.execute("ALTER TABLE servers ADD COLUMN type TEXT DEFAULT 'xui'")
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS payment_cards (
+            card_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            card_number TEXT NOT NULL,
+            owner_name TEXT NOT NULL,
+            is_active BOOLEAN DEFAULT TRUE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        ''')
+
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS configs (
         config_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -100,11 +142,19 @@ def init_db():
         email TEXT UNIQUE,
         client_id TEXT,
         total_gb REAL,
+        server_id TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         is_active BOOLEAN DEFAULT TRUE,
         FOREIGN KEY (user_id) REFERENCES users (user_id)
     )
     ''')
+
+    # Migration: add server_id column if missing
+    cursor.execute("PRAGMA table_info(configs)")
+    config_columns = [column_info[1] for column_info in cursor.fetchall()]
+    if 'server_id' not in config_columns:
+        logger.info("Adding server_id column to configs table")
+        cursor.execute('ALTER TABLE configs ADD COLUMN server_id TEXT')
 
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS app_settings (
@@ -196,12 +246,13 @@ def init_db():
     cursor.execute("PRAGMA table_info(payments)")
     payment_columns = [column_info[1] for column_info in cursor.fetchall()]
     for column_name, column_definition in (
-        ('payment_type', "TEXT DEFAULT 'service'"),
-        ('amount', 'REAL DEFAULT 0'),
-        ('target_email', 'TEXT'),
-        ('target_client_id', 'TEXT'),
-        ('plan_key', 'TEXT'),
-        ('plan_gb', 'REAL DEFAULT 0'),
+            ('payment_type', "TEXT DEFAULT 'service'"),
+            ('amount', 'REAL DEFAULT 0'),
+            ('target_email', 'TEXT'),
+            ('target_client_id', 'TEXT'),
+            ('plan_key', 'TEXT'),
+            ('plan_gb', 'REAL DEFAULT 0'),
+            ('server_id', 'TEXT'),  # <-- ADD THIS
     ):
         if column_name not in payment_columns:
             logger.info("Adding %s column to payments table", column_name)
@@ -228,6 +279,27 @@ def init_db():
         FOREIGN KEY (ticket_id) REFERENCES tickets (ticket_id),
         FOREIGN KEY (sender_id) REFERENCES users (user_id)
     )''')
+
+    # Seed servers from environment if DB is empty
+    from config import ENV_SERVERS
+    cursor.execute('SELECT COUNT(*) FROM servers')
+    if cursor.fetchone()[0] == 0 and ENV_SERVERS:
+        logger.info("Seeding %d servers from environment", len(ENV_SERVERS))
+        for idx, srv in enumerate(ENV_SERVERS):
+            cursor.execute(
+                '''
+                INSERT OR IGNORE INTO servers 
+                (server_id, name, url, username, password, inbound_id, host, port, sni, vless_text, sub_port, sub_path, is_active, sort_order)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''',
+                (
+                    srv['id'], srv['name'], srv['url'], srv['username'], srv['password'],
+                    srv['inbound_id'], srv.get('host', ''), srv.get('port', 443),
+                    srv.get('sni', ''), srv.get('vless_text', ''),
+                    srv.get('sub_port', 0), srv.get('sub_path', 'sub'),
+                    1 if srv.get('is_active', True) else 0, idx
+                )
+            )
 
     conn.commit()
     conn.close()
@@ -693,15 +765,15 @@ def consume_invite_code(code, username, linked_user_id):
     conn.close()
     return updated > 0
 
-def save_new_config(user_id, email, client_id, total_gb):
-    """Save a new VPN configuration"""
+def save_new_config(user_id, email, client_id, total_gb, server_id=None):
+    """Save a new VPN configuration with optional server_id."""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
 
     cursor.execute('''
-    INSERT INTO configs (user_id, email, client_id, total_gb)
-    VALUES (?, ?, ?, ?)
-    ''', (user_id, email, client_id, total_gb))
+    INSERT INTO configs (user_id, email, client_id, total_gb, server_id)
+    VALUES (?, ?, ?, ?, ?)
+    ''', (user_id, email, client_id, total_gb, server_id))
 
     config_id = cursor.lastrowid
     conn.commit()
@@ -737,15 +809,19 @@ def log_status_check(config_id, remaining_gb, remaining_days):
     conn.commit()
     conn.close()
 
-def save_payment_request(user_id, plan_name, file_id, payment_type='service', amount=0, target_email=None, target_client_id=None, plan_key=None, plan_gb=None):
-    """Save a payment request"""
+def save_payment_request(user_id, plan_name, file_id, payment_type='service',
+                         amount=0, target_email=None, target_client_id=None,
+                         plan_key=None, plan_gb=None, server_id=None):
+    """Save a payment request with optional server_id."""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
 
     cursor.execute('''
-    INSERT INTO payments (user_id, plan, receipt_file_id, payment_type, amount, target_email, target_client_id, plan_key, plan_gb)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (user_id, plan_name, file_id, payment_type, amount, target_email, target_client_id, plan_key, plan_gb))
+    INSERT INTO payments 
+    (user_id, plan, receipt_file_id, payment_type, amount, target_email, target_client_id, plan_key, plan_gb, server_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (user_id, plan_name, file_id, payment_type, amount,
+          target_email, target_client_id, plan_key, plan_gb, server_id))
 
     payment_id = cursor.lastrowid
     conn.commit()
@@ -754,7 +830,7 @@ def save_payment_request(user_id, plan_name, file_id, payment_type='service', am
 
 
 def get_payment_record(payment_id):
-    """Return the full payment row for approval flows."""
+    """Return the full payment row for approval flows (includes server_id)."""
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
@@ -762,8 +838,8 @@ def get_payment_record(payment_id):
     cursor.execute(
         '''
         SELECT p.payment_id, p.user_id, p.plan, p.receipt_file_id, p.payment_type,
-             COALESCE(p.amount, 0) AS amount, p.target_email, p.target_client_id,
-             p.plan_key, COALESCE(p.plan_gb, 0) AS plan_gb,
+               COALESCE(p.amount, 0) AS amount, p.target_email, p.target_client_id,
+               p.plan_key, COALESCE(p.plan_gb, 0) AS plan_gb, p.server_id,
                p.status, p.submitted_at, p.approved_at,
                u.username, u.first_name
         FROM payments p
@@ -1225,12 +1301,14 @@ def get_ticket_conversation(ticket_id, user_id, admin_ids=None):
     }
 
 def get_pending_payments():
-    """Get all pending payment requests"""
+    """Get all pending payment requests (includes server_id)."""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
 
     cursor.execute('''
-    SELECT p.payment_id, p.user_id, p.plan, u.first_name, u.username, p.receipt_file_id, p.payment_type, COALESCE(p.amount, 0), p.plan_key, COALESCE(p.plan_gb, 0)
+    SELECT p.payment_id, p.user_id, p.plan, u.first_name, u.username, 
+           p.receipt_file_id, p.payment_type, COALESCE(p.amount, 0), 
+           p.plan_key, COALESCE(p.plan_gb, 0), p.server_id
     FROM payments p
     JOIN users u ON p.user_id = u.user_id
     WHERE p.status = 'pending'
@@ -1242,12 +1320,13 @@ def get_pending_payments():
     return pending_payments
 
 def get_all_configs_with_users():
-    """Get all active configs with user information for notification checking"""
+    """Get all active configs with user information including server_id."""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
 
     cursor.execute('''
-    SELECT c.config_id, c.user_id, c.email, c.client_id, c.total_gb, c.is_active, c.last_notified, 
+    SELECT c.config_id, c.user_id, c.email, c.client_id, c.total_gb, 
+           c.is_active, c.last_notified, c.server_id,
            u.username, u.first_name
     FROM configs c
     JOIN users u ON c.user_id = u.user_id
@@ -1267,8 +1346,9 @@ def get_all_configs_with_users():
             'total_gb': row[4],
             'is_active': row[5],
             'last_notified': row[6],
-            'username': row[7],
-            'first_name': row[8]
+            'server_id': row[7],
+            'username': row[8],
+            'first_name': row[9]
         })
 
     return configs
@@ -1448,3 +1528,290 @@ def delete_config_by_client_id(client_id):
         return False
     finally:
         conn.close()
+
+
+# ============================================================
+# SERVER MANAGEMENT FUNCTIONS
+# ============================================================
+
+def get_all_servers(include_inactive=False):
+    """Return all configured servers."""
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    query = 'SELECT * FROM servers'
+    if not include_inactive:
+        query += ' WHERE is_active = 1'
+    query += ' ORDER BY sort_order ASC, name ASC'
+
+    cursor.execute(query)
+    servers = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return servers
+
+
+def get_server(server_id):
+    """Return a single server by ID."""
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    cursor.execute('SELECT * FROM servers WHERE server_id = ?', (server_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_active_servers():
+    """Return list of active server IDs and names."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    cursor.execute('SELECT server_id, name FROM servers WHERE is_active = 1 ORDER BY sort_order ASC')
+    servers = cursor.fetchall()
+    conn.close()
+    return servers
+
+def save_server(server_id, name, url, username, password, inbound_id,
+                host=None, port=443, sni=None, vless_text=None,
+                sub_port=0, sub_path='sub', is_active=True, sort_order=None, server_type='xui'):
+    """Insert or update a server configuration."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    if sort_order is None:
+        cursor.execute('SELECT COALESCE(MAX(sort_order), 0) + 1 FROM servers')
+        sort_order = cursor.fetchone()[0]
+
+    cursor.execute(
+        '''
+        INSERT INTO servers 
+        (server_id, name, url, username, password, inbound_id, host, port, sni, vless_text, sub_port, sub_path, is_active, sort_order, type, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(server_id) DO UPDATE SET
+            name = excluded.name,
+            url = excluded.url,
+            username = excluded.username,
+            password = excluded.password,
+            inbound_id = excluded.inbound_id,
+            host = excluded.host,
+            port = excluded.port,
+            sni = excluded.sni,
+            vless_text = excluded.vless_text,
+            sub_port = excluded.sub_port,
+            sub_path = excluded.sub_path,
+            is_active = excluded.is_active,
+            type = excluded.type,
+            updated_at = CURRENT_TIMESTAMP
+        ''',
+        (server_id, name, url.rstrip('/'), username, password, inbound_id,
+         host, port, sni, vless_text, sub_port, sub_path,
+         1 if is_active else 0, sort_order, server_type)
+    )
+
+    conn.commit()
+    conn.close()
+    return server_id
+
+def delete_server(server_id):
+    """Delete a server by ID (only if no configs reference it)."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    # Check if any configs reference this server
+    cursor.execute('SELECT COUNT(*) FROM configs WHERE server_id = ?', (server_id,))
+    count = cursor.fetchone()[0]
+    if count > 0:
+        conn.close()
+        return False, f"{count} config(s) still reference this server"
+
+    cursor.execute('DELETE FROM servers WHERE server_id = ?', (server_id,))
+    deleted = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted, None if deleted else "Server not found"
+
+
+def toggle_server_active(server_id, is_active):
+    """Enable or disable a server."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        'UPDATE servers SET is_active = ?, updated_at = CURRENT_TIMESTAMP WHERE server_id = ?',
+        (1 if is_active else 0, server_id)
+    )
+    updated = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return updated
+
+
+def get_server_for_config(email, user_id):
+    """Return server_id for a given config."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        'SELECT server_id FROM configs WHERE email = ? AND user_id = ?',
+        (email, user_id)
+    )
+    result = cursor.fetchone()
+    conn.close()
+    return result[0] if result else None
+
+
+def get_user_configs_with_server(user_id):
+    """Get all configs for a user including server information."""
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    cursor.execute('''
+    SELECT c.config_id, c.email, c.client_id, c.total_gb, c.is_active, 
+           c.server_id, s.name AS server_name
+    FROM configs c
+    LEFT JOIN servers s ON c.server_id = s.server_id
+    WHERE c.user_id = ?
+    ORDER BY c.created_at DESC
+    ''', (user_id,))
+
+    configs = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return configs
+
+def add_payment_card(card_number, owner_name):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('INSERT INTO payment_cards (card_number, owner_name) VALUES (?, ?)', (card_number, owner_name))
+    conn.commit()
+    conn.close()
+
+def get_all_payment_cards():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM payment_cards ORDER BY created_at DESC')
+    cards = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return cards
+
+def get_active_payment_cards():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM payment_cards WHERE is_active = 1 ORDER BY created_at DESC')
+    cards = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return cards
+
+def toggle_payment_card(card_id):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('UPDATE payment_cards SET is_active = NOT is_active WHERE card_id = ?', (card_id,))
+    conn.commit()
+    conn.close()
+
+def delete_payment_card(card_id):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM payment_cards WHERE card_id = ?', (card_id,))
+    conn.commit()
+    conn.close()
+
+def get_config_by_client_id(client_id):
+    """Return a config row by client_id, or None."""
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    cursor.execute(
+        '''
+        SELECT config_id, user_id, email, client_id, total_gb, is_active, server_id, created_at
+        FROM configs
+        WHERE client_id = ?
+        ''',
+        (client_id,)
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def assign_config_to_user(user_id, email, client_id, total_gb, server_id=None):
+    """Assign an existing (orphan) client to a user by inserting a DB row.
+
+    Returns (success, message).
+    """
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    try:
+        # Refuse if client_id or email already exists
+        cursor.execute('SELECT user_id FROM configs WHERE client_id = ?', (client_id,))
+        row = cursor.fetchone()
+        if row:
+            conn.close()
+            return False, f"این کانفیگ قبلا به کاربر {row[0]} اختصاص داده شده است."
+
+        cursor.execute('SELECT user_id FROM configs WHERE email = ?', (email,))
+        row = cursor.fetchone()
+        if row:
+            conn.close()
+            return False, f"این ایمیل قبلا برای کاربر {row[0]} ثبت شده است."
+
+        cursor.execute(
+            '''
+            INSERT INTO configs (user_id, email, client_id, total_gb, server_id, is_active)
+            VALUES (?, ?, ?, ?, ?, 1)
+            ''',
+            (user_id, email, client_id, total_gb, server_id)
+        )
+        conn.commit()
+        return True, "کانفیگ با موفقیت به کاربر اختصاص یافت."
+    except Exception as e:
+        logger.error(f"Error assigning config {client_id} to user {user_id}: {e}")
+        conn.rollback()
+        return False, str(e)
+    finally:
+        conn.close()
+
+
+def get_user_by_id(user_id):
+    """Return basic user info by Telegram user id."""
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    cursor.execute(
+        'SELECT user_id, username, first_name, last_name FROM users WHERE user_id = ?',
+        (user_id,)
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def search_users(query, limit=20):
+    """Search users by username, first_name, or user_id."""
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    q = f"%{query}%"
+    cursor.execute(
+        '''
+        SELECT user_id, username, first_name, last_name
+        FROM users
+        WHERE CAST(user_id AS TEXT) LIKE ?
+           OR username LIKE ?
+           OR first_name LIKE ?
+        ORDER BY user_id DESC
+        LIMIT ?
+        ''',
+        (q, q, q, limit)
+    )
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return rows

@@ -37,62 +37,71 @@ async def send_notification(bot, user_id, message):
         return False
 
 async def check_and_notify_expiring_configs(bot):
-    """Check for configs near expiry or data limit and send notifications"""
+    """Check for configs near expiry or data limit and send notifications (multi-server)."""
     logger.info("Starting check for expiring configs")
 
-    # Ensure we're authenticated with the XUI panel once at the beginning
-    if not ensure_authenticated():
-        logger.error("Failed to authenticate with XUI panel")
-        return
-
-    # Get all configs with user info
     configs = get_all_configs_with_users()
 
     for config in configs:
         config_id = config['config_id']
         user_id = config['user_id']
         email = config['email']
+        server_id = config.get('server_id')
         last_notified = config['last_notified']
+
+        if not server_id:
+            logger.warning(f"Config {email} has no server_id, skipping")
+            continue
+
+        # Ignore manual servers
+        from database import get_server
+        srv = get_server(server_id)
+        if srv and srv.get('type') == 'manual':
+            continue
 
         # Skip if already notified in the last 24 hours
         if last_notified and (datetime.now() - datetime.strptime(last_notified, '%Y-%m-%d %H:%M:%S')).total_seconds() < 86400:
             continue
 
-        # Get current status from XUI panel - no need to login again for each check
-        status = get_client_status(email)
+        # Get status from the correct server
+        from xui_api import get_client_status, ensure_authenticated
+        if not ensure_authenticated(server_id):
+            logger.warning(f"Could not authenticate to server {server_id}")
+            continue
+
+        status = get_client_status(server_id, email)
         if not status:
-            logger.warning(f"Could not retrieve status for config {email}")
+            logger.warning(f"Could not retrieve status for config {email} on {server_id}")
             continue
 
         notification_needed = False
         notification_message = "⚠️ **هشدار وضعیت سرویس VPN** ⚠️\n\n"
 
-        # Check for traffic limit
         total_gb = status['total_gb']
         remaining_gb = status['remaining_gb']
         used_percentage = ((total_gb - remaining_gb) / total_gb) * 100 if total_gb > 0 else 0
 
         if used_percentage >= TRAFFIC_THRESHOLD_PERCENTAGE:
             notification_needed = True
-            notification_message += f"🔄 سرویس شما با نام {email} به {used_percentage:.1f}% از حجم ترافیک ��ود رسیده است.\n"
+            notification_message += f"🔄 سرویس شما با نام {email} به {used_percentage:.1f}% از حجم ترافیک خود رسیده است.\n"
             notification_message += f"حجم باقیمانده: {remaining_gb:.2f} GB\n\n"
 
-        # Check for expiry date
         remaining_days = status['remaining_days']
         remaining_hours = status['remaining_hours']
+        has_real_expiry = status['expiry_date'] != '1970-01-01'
+        if not has_real_expiry and not notification_needed:
+            continue
 
         if remaining_days <= DAYS_THRESHOLD:
             notification_needed = True
             notification_message += f"⏰ سرویس شما با نام {email} تنها {status['remaining_time_display']} دیگر اعتبار دارد.\n"
             notification_message += f"تاریخ انقضا: {status['expiry_date']}\n\n"
 
-        # Send notification if needed
         if notification_needed:
             notification_message += "برای تمدید سرویس یا خرید سرویس جدید، لطفا از منوی اصلی ربات استفاده کنید."
             success = await send_notification(bot, user_id, notification_message)
 
             if success:
-                # Update notification timestamp
                 update_notification_sent(config_id)
 
 def run_scheduler():

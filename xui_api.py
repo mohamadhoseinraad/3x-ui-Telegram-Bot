@@ -1,5 +1,5 @@
 """
-XUI Panel API interactions
+XUI Panel API interactions - Multi-server support
 """
 import requests
 import json
@@ -7,75 +7,110 @@ import logging
 import time
 from datetime import datetime, timedelta
 import uuid
-from config import XUI_URL, XUI_USERNAME, XUI_PASSWORD, INBOUND_ID, USE_ONE_MONTH_MODE
+from config import USE_ONE_MONTH_MODE
+from database import get_server, get_active_servers
 
 logger = logging.getLogger(__name__)
-session = requests.Session()
-session.trust_env = False
-_session_authenticated = False
-_last_login_time = 0
+
 # Session timeout in seconds (30 minutes)
 SESSION_TIMEOUT = 1800
 
-def login_to_xui(force=False):
-    """Login to the XUI panel
+# Per-server session state
+# Structure: { server_id: { 'session': requests.Session, 'authenticated': bool, 'last_login': float, 'config': dict } }
+_server_sessions = {}
 
-    Args:
-        force (bool): Force re-login even if session is still valid
 
-    Returns:
-        bool: True if login successful, False otherwise
+def _get_server_config(server_id):
+    """Fetch server config from DB."""
+    srv = get_server(server_id)
+    if not srv:
+        logger.error(f"Server not found: {server_id}")
+        return None
+    return srv
+
+
+def _get_session(server_id, force_refresh=False):
     """
-    global _session_authenticated, _last_login_time
+    Get or create a requests.Session for the given server.
+    Returns (session, server_config) or (None, None) on failure.
+    """
+    global _server_sessions
 
-    # If already logged in and session is fresh, don't re-login unless forced
+    srv = _get_server_config(server_id)
+    if not srv:
+        return None, None
+
+    state = _server_sessions.get(server_id)
+    if state is None or force_refresh:
+        state = {
+            'session': requests.Session(),
+            'authenticated': False,
+            'last_login': 0,
+            'config': srv,
+        }
+        state['session'].trust_env = False
+        _server_sessions[server_id] = state
+    else:
+        # Refresh config in case it changed
+        state['config'] = srv
+
+    return state['session'], state['config']
+
+
+def login_to_xui(server_id, force=False):
+    """Login to a specific XUI server."""
+    session, srv = _get_session(server_id)
+    if not session or not srv:
+        return False
+
+    state = _server_sessions[server_id]
     current_time = time.time()
-    if _session_authenticated and (current_time - _last_login_time) < SESSION_TIMEOUT and not force:
+
+    # Already logged in and session fresh
+    if state['authenticated'] and (current_time - state['last_login']) < SESSION_TIMEOUT and not force:
         return True
 
-    url = f"{XUI_URL}/login"
-    data = {"username": XUI_USERNAME, "password": XUI_PASSWORD}
+    url = f"{srv['url']}/login"
+    data = {"username": srv['username'], "password": srv['password']}
+
     try:
         response = session.post(url, json=data, timeout=20)
         if response.ok:
-            _session_authenticated = True
-            _last_login_time = current_time
-            logger.info("Successfully logged in to XUI panel")
+            state['authenticated'] = True
+            state['last_login'] = current_time
+            logger.info(f"Logged in to server '{server_id}'")
             return True
         else:
-            _session_authenticated = False
-            logger.error(f"Login failed with status code: {response.status_code}")
+            state['authenticated'] = False
+            logger.error(f"Login failed for '{server_id}' status={response.status_code}")
             return False
     except Exception as e:
-        _session_authenticated = False
-        logger.error(f"Exception during login: {e}")
+        state['authenticated'] = False
+        logger.error(f"Login exception for '{server_id}': {e}")
         return False
 
-def ensure_authenticated():
-    """Ensure the session is authenticated, attempt re-login if needed
 
-    Returns:
-        bool: True if authenticated, False otherwise
-    """
-    global _session_authenticated
-
-    # Try using current session
-    if _session_authenticated:
+def ensure_authenticated(server_id):
+    """Ensure session is authenticated for the given server."""
+    state = _server_sessions.get(server_id)
+    if state and state.get('authenticated'):
         return True
+    return login_to_xui(server_id)
 
-    # Session not authenticated, attempt login
-    return login_to_xui()
 
-def get_client_status(email):
-    """Get the status of a client by email"""
-    if not ensure_authenticated():
+def get_client_status(server_id, email):
+    """Get status of a client on a specific server."""
+    if not ensure_authenticated(server_id):
         return None
 
-    response = session.get(f"{XUI_URL}/panel/api/inbounds/getClientTraffics/{email}")
-    # If unauthorized, try logging in again and retry
+    session, srv = _get_session(server_id)
+    if not session or not srv:
+        return None
+
+    response = session.get(f"{srv['url']}/panel/api/inbounds/getClientTraffics/{email}")
     if response.status_code == 401:
-        if login_to_xui(force=True):
-            response = session.get(f"{XUI_URL}/panel/api/inbounds/getClientTraffics/{email}")
+        if login_to_xui(server_id, force=True):
+            response = session.get(f"{srv['url']}/panel/api/inbounds/getClientTraffics/{email}")
         else:
             return None
 
@@ -95,11 +130,9 @@ def get_client_status(email):
         expiry_time = data.get('expiryTime', 0) / 1000
         remaining_seconds = max(0, expiry_time - time.time())
 
-        # Calculate days and hours separately for more precise display
         remaining_days = int(remaining_seconds // 86400)
         remaining_hours = int((remaining_seconds % 86400) // 3600)
 
-        # Format the remaining time display
         if remaining_days > 0:
             remaining_time_display = f"{remaining_days} روز"
             if remaining_hours > 0:
@@ -109,6 +142,7 @@ def get_client_status(email):
 
         return {
             'email': email,
+            'server_id': server_id,
             'remaining_gb': remaining_gb,
             'remaining_days': remaining_days,
             'remaining_hours': remaining_hours,
@@ -120,101 +154,85 @@ def get_client_status(email):
             'subId': data.get('subId', None)
         }
     except Exception as e:
-        logger.error(f"Error parsing client status: {e}")
+        logger.error(f"Error parsing client status on '{server_id}': {e}")
         return None
 
-def create_client(email, total_gb, expiry_time_ms):
-    """Create a new client in the XUI panel"""
-    if not ensure_authenticated():
-        return None, "Failed to login to XUI panel"
+
+def create_client(server_id, email, total_gb, expiry_time_ms):
+    """Create a new client on a specific server."""
+    if not ensure_authenticated(server_id):
+        return None, f"Failed to login to server '{server_id}'"
+
+    session, srv = _get_session(server_id)
+    if not session or not srv:
+        return None, "Server not found"
 
     client_id = str(uuid.uuid4())
     total_gb = int(total_gb)
     if USE_ONE_MONTH_MODE:
         expiry_time_ms = int((datetime.now() + timedelta(days=30)).timestamp() * 1000)
 
-
     settings = {
-        "clients": [
-            {
-                "id": client_id,
-                "flow": "",
-                "email": email,
-                "limitIp": 0,
-                "totalGB": total_gb,
-                "expiryTime": expiry_time_ms,
-                "enable": True,
-                "tgId": "",
-                "subId": str(uuid.uuid4())[:16],
-                "reset": 0
-            }
-        ]
+        "clients": [{
+            "id": client_id,
+            "flow": "",
+            "email": email,
+            "limitIp": 0,
+            "totalGB": total_gb,
+            "expiryTime": expiry_time_ms,
+            "enable": True,
+            "tgId": "",
+            "subId": str(uuid.uuid4())[:16],
+            "reset": 0
+        }]
     }
 
     payload = {
-        "id": INBOUND_ID,
+        "id": srv['inbound_id'],
         "settings": json.dumps(settings, ensure_ascii=False)
     }
 
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json"
-    }
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
 
     try:
         response = session.post(
-            f"{XUI_URL}/panel/api/inbounds/addClient",
-            headers=headers,
-            json=payload,
-            timeout=20
+            f"{srv['url']}/panel/api/inbounds/addClient",
+            headers=headers, json=payload, timeout=20
         )
-        # If unauthorized, try logging in again and retry
         if response.status_code == 401:
-            if login_to_xui(force=True):
+            if login_to_xui(server_id, force=True):
                 response = session.post(
-                    f"{XUI_URL}/panel/api/inbounds/addClient",
-                    headers=headers,
-                    json=payload,
-                    timeout=20
+                    f"{srv['url']}/panel/api/inbounds/addClient",
+                    headers=headers, json=payload, timeout=20
                 )
 
         response.raise_for_status()
-
         data = response.json()
         if not data.get("success"):
             return None, data.get("msg", "Error adding client")
 
         return client_id, None
     except Exception as e:
-        logger.error(f"Error creating client: {e}")
+        logger.error(f"Error creating client on '{server_id}': {e}")
         return None, str(e)
 
-def extend_client(email, client_id, additional_gb, new_expiry_time_ms=None):
-    """Extend an existing client's quota and/or expiry time
 
-    Args:
-        email (str): Client's email identifier
-        client_id (str): Client's UUID
-        additional_gb (int): Additional GB to add to the client's quota
-        new_expiry_time_ms (int|timedelta|None, optional): New expiry time in milliseconds.
-                           If a timedelta is passed, it is added to the current expiry.
-                           If an integer timestamp is passed, it is used directly.
+def extend_client(server_id, email, client_id, additional_gb, new_expiry_time_ms=None):
+    """Extend an existing client on a specific server."""
+    if not ensure_authenticated(server_id):
+        return False, f"Failed to login to server '{server_id}'"
 
-    Returns:
-        tuple: (success (bool), error_message (str or None))
-    """
-    if not ensure_authenticated():
-        return False, "Failed to login to XUI panel"
+    session, srv = _get_session(server_id)
+    if not session or not srv:
+        return False, "Server not found"
 
-    # First get current client data
-    client_status = get_client_status(email)
+    client_status = get_client_status(server_id, email)
     if not client_status:
         return False, "Could not find client information"
 
-    # Calculate new total GB
     current_total_gb = client_status['total_gb']
     new_total_gb = current_total_gb + additional_gb
-    total_bytes = int(new_total_gb * (1024 ** 3))  # Convert GB to bytes
+    total_bytes = int(new_total_gb * (1024 ** 3))
 
     if USE_ONE_MONTH_MODE:
         current_expiry = datetime.fromtimestamp((client_status.get('expiry_time_ms')) / 1000)
@@ -222,109 +240,93 @@ def extend_client(email, client_id, additional_gb, new_expiry_time_ms=None):
     else:
         expiry_time_ms = int(new_expiry_time_ms)
 
-
-    # Prepare the settings for client update
     settings = {
-        "clients": [
-            {
-                "id": client_id,
-                "flow": "",
-                "email": email,
-                "limitIp": 0,
-                "totalGB": total_bytes,
-                "expiryTime": expiry_time_ms,
-                "enable": True,
-                "tgId": "",
-                "subId": client_id[:16],  # Use part of the client_id for consistency
-                "reset": 0
-            }
-        ]
+        "clients": [{
+            "id": client_id,
+            "flow": "",
+            "email": email,
+            "limitIp": 0,
+            "totalGB": total_bytes,
+            "expiryTime": expiry_time_ms,
+            "enable": True,
+            "tgId": "",
+            "subId": client_id[:16],
+            "reset": 0
+        }]
     }
 
     payload = {
-        "id": INBOUND_ID,
+        "id": srv['inbound_id'],
         "settings": json.dumps(settings, ensure_ascii=False)
     }
 
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json"
-    }
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
 
     try:
-        # Use the updateClient endpoint with the client's UUID
         response = session.post(
-            f"{XUI_URL}/panel/api/inbounds/updateClient/{client_id}",
-            headers=headers,
-            json=payload,
-            timeout=20
+            f"{srv['url']}/panel/api/inbounds/updateClient/{client_id}",
+            headers=headers, json=payload, timeout=20
         )
-
-        # If unauthorized, try logging in again and retry
         if response.status_code == 401:
-            if login_to_xui(force=True):
+            if login_to_xui(server_id, force=True):
                 response = session.post(
-                    f"{XUI_URL}/panel/api/inbounds/updateClient/{client_id}",
-                    headers=headers,
-                    json=payload,
-                    timeout=20
+                    f"{srv['url']}/panel/api/inbounds/updateClient/{client_id}",
+                    headers=headers, json=payload, timeout=20
                 )
 
         response.raise_for_status()
-
         data = response.json()
         if not data.get("success"):
             return False, f"Error updating client: {data.get('msg', 'Unknown error')}"
 
         return True, None
-
     except Exception as e:
-        logger.error(f"Error extending client: {e}")
+        logger.error(f"Error extending client on '{server_id}': {e}")
         return False, str(e)
 
-def get_all_clients():
-    """Get all clients from the XUI panel
 
-    Returns:
-        list: List of clients or None if error
-    """
-    if not ensure_authenticated():
+def get_all_clients(server_id):
+    """Get all clients from a specific server."""
+    if not ensure_authenticated(server_id):
+        return None
+
+    session, srv = _get_session(server_id)
+    if not session or not srv:
         return None
 
     try:
-        response = session.get(f"{XUI_URL}/panel/api/inbounds/list")
+        response = session.get(f"{srv['url']}/panel/api/inbounds/list")
 
-        # If unauthorized, try logging in again and retry
         if response.status_code == 401:
-            if login_to_xui(force=True):
-                response = session.get(f"{XUI_URL}/panel/api/inbounds/list")
+            if login_to_xui(server_id, force=True):
+                response = session.get(f"{srv['url']}/panel/api/inbounds/list")
             else:
                 return None
 
         if not response.ok:
-            logger.error(f"Failed to get inbounds list: {response.status_code}")
+            logger.error(f"Failed to get inbounds list from '{server_id}': {response.status_code}")
             return None
 
         data = response.json()
         if not data.get("success"):
-            logger.error(f"API error: {data.get('msg', 'Unknown error')}")
+            logger.error(f"API error on '{server_id}': {data.get('msg', 'Unknown error')}")
             return None
 
         all_clients = []
         inbounds = data.get("obj", [])
 
         for inbound in inbounds:
-            if str(inbound.get("id")) == str(INBOUND_ID):
+            if str(inbound.get("id")) == str(srv['inbound_id']):
                 settings = json.loads(inbound.get("settings", "{}"))
                 clients = settings.get("clients", [])
 
-                # Include the inbound ID with each client for reference
                 for client in clients:
                     client["inboundId"] = inbound.get("id")
+                    client["server_id"] = server_id
+                    client["server_name"] = srv.get('name', server_id)
 
-                    # Get traffic information for this client
                     if client.get("email"):
-                        traffic_info = get_client_status(client.get("email"))
+                        traffic_info = get_client_status(server_id, client.get("email"))
                         if traffic_info:
                             client.update({
                                 "remaining_gb": traffic_info.get("remaining_gb"),
@@ -338,33 +340,46 @@ def get_all_clients():
 
         return all_clients
     except Exception as e:
-        logger.error(f"Error getting all clients: {e}")
+        logger.error(f"Error getting all clients from '{server_id}': {e}")
         return None
 
-def delete_client(client_id):
-    """Delete a client by UUID
 
-    Args:
-        client_id (str): Client UUID to delete
+def get_all_clients_multi_server():
+    """Get clients from ALL active servers."""
+    results = []
+    for server_id, name in get_active_servers():
+        clients = get_all_clients(server_id)
+        if clients:
+            for c in clients:
+                c['server_id'] = server_id
+                c['server_name'] = name
+            results.extend(clients)
+    return results
 
-    Returns:
-        bool: True if successful, False otherwise
-    """
-    if not ensure_authenticated():
-        return False, "Failed to login to XUI panel"
+
+def delete_client(server_id, client_id):
+    """Delete a client from a specific server."""
+    if not ensure_authenticated(server_id):
+        return False, f"Failed to login to server '{server_id}'"
+
+    session, srv = _get_session(server_id)
+    if not session or not srv:
+        return False, "Server not found"
 
     try:
-        response = session.post(f"{XUI_URL}/panel/api/inbounds/{INBOUND_ID}/delClient/{client_id}")
-
-        # If unauthorized, try logging in again and retry
+        response = session.post(
+            f"{srv['url']}/panel/api/inbounds/{srv['inbound_id']}/delClient/{client_id}"
+        )
         if response.status_code == 401:
-            if login_to_xui(force=True):
-                response = session.post(f"{XUI_URL}/panel/api/inbounds/{INBOUND_ID}/delClient/{client_id}")
+            if login_to_xui(server_id, force=True):
+                response = session.post(
+                    f"{srv['url']}/panel/api/inbounds/{srv['inbound_id']}/delClient/{client_id}"
+                )
             else:
                 return False, "Authentication failed"
 
         if not response.ok:
-            return False, f"API request failed with status code: {response.status_code}"
+            return False, f"API request failed: {response.status_code}"
 
         data = response.json()
         if not data.get("success"):
@@ -372,5 +387,53 @@ def delete_client(client_id):
 
         return True, None
     except Exception as e:
-        logger.error(f"Error deleting client: {e}")
+        logger.error(f"Error deleting client from '{server_id}': {e}")
         return False, str(e)
+
+
+# ============================================================
+# BACKWARD COMPATIBILITY WRAPPERS (single default server)
+# ============================================================
+def _default_server_id():
+    """Return the first active server ID."""
+    servers = get_active_servers()
+    return servers[0][0] if servers else None
+
+
+def _legacy_get_client_status(email):
+    sid = _default_server_id()
+    return get_client_status(sid, email) if sid else None
+
+def _legacy_create_client(email, total_gb, expiry_time_ms):
+    sid = _default_server_id()
+    return create_client(sid, email, total_gb, expiry_time_ms) if sid else (None, "No server configured")
+
+def _legacy_extend_client(email, client_id, additional_gb, new_expiry_time_ms=None):
+    sid = _default_server_id()
+    return extend_client(sid, email, client_id, additional_gb, new_expiry_time_ms) if sid else (False, "No server configured")
+
+def _legacy_get_all_clients():
+    return get_all_clients_multi_server()
+
+def _legacy_delete_client(client_id):
+    """Delete a client - must search all servers to find it."""
+    # Try to find the server_id from DB by client_id
+    from database import DB_FILE
+    import sqlite3
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('SELECT server_id FROM configs WHERE client_id = ?', (client_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if row and row[0]:
+        return delete_client(row[0], client_id)
+    # Fallback: try all active servers
+    for sid, _ in get_active_servers():
+        ok, err = delete_client(sid, client_id)
+        if ok:
+            return True, None
+    return False, "Client not found on any server"
+
+
+# Export legacy names for callers that haven't been migrated
+ensure_authenticated_legacy = lambda: True  # no-op; not used by multi-server code

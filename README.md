@@ -8,6 +8,7 @@ This Telegram bot provides a user-friendly interface for managing VPN services. 
 
 ## Features
 
+- **Multi-Server Architecture**: Add, edit, and manage multiple XUI servers directly from the bot's Admin Panel without touching configuration files.
 - **User Management**: Create and manage VPN user accounts
 - **VPN Configuration**: Generate, activate, and deactivate VPN configurations
 - **Free Trial System**: Offer limited-time free trials to new users
