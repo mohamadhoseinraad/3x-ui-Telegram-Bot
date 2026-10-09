@@ -284,6 +284,28 @@ async def _fulfill_order_with_wallet(query, user_id, context, order):
         return False
 
     try:
+        srv = get_server(server_id)
+        is_manual = srv and srv.get('type') == 'manual'
+
+        # IF SERVER IS MANUAL: Queue the order instead of instant generation
+        if is_manual:
+            adjust_wallet_balance(user_id, -cost)
+            payment_id = save_payment_request(
+                user_id, order['label'], "text:پرداخت از کیف پول",
+                payment_type=order['kind'], amount=cost,
+                target_email=order.get('email'), target_client_id=order.get('client_id'),
+                plan_key=order.get('plan_key'), plan_gb=order.get('gb'), server_id=server_id
+            )
+            await _send_payment_notification(context, payment_id, query.from_user, order, "text:پرداخت از کیف پول",
+                                             order['kind'])
+
+            await query.edit_message_text(
+                f"✅ مبلغ {_format_wallet_amount(cost)} از کیف پول شما کسر شد.\n\n"
+                "از آنجا که این سرور از نوع **دستی (Manual)** است، درخواست شما برای پشتیبانی ارسال شد و پس از بررسی، لینک کانفیگ ارسال خواهد شد.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(get_back_to_main_button())
+            )
+            return True
         if order['kind'] == 'extension':
             email = order['email']
             client_id = order['client_id']
@@ -644,14 +666,23 @@ async def handle_show_status(query, email, user_id):
     server_id = get_server_for_config(email, user_id)
     client_id = get_client_id_by_email(email, user_id)
 
-    if not client_id:
+    if not client_id or not server_id:
         await query.edit_message_text("خطا در دریافت اطلاعات سرویس.",
                                       reply_markup=InlineKeyboardMarkup(get_back_to_main_button()))
         return
 
-    if not server_id:
-        await query.edit_message_text("سرور مربوطه یافت نشد.",
-                                      reply_markup=InlineKeyboardMarkup(get_back_to_main_button()))
+    srv = get_server(server_id)
+    server_name = srv['name'] if srv else server_id
+
+    if srv and srv.get('type') == 'manual':
+        message = (
+            f"✅ وضعیت سرویس:\n"
+            f"🖥️ سرور: {server_name}\n"
+            f"📧 نام: `{email}`\n\n"
+            f"⚠️ *این سرویس آمار مصرف آن به صورت خودکار قابل دریافت نیست.*"
+        )
+        reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="check_status")]])
+        await query.edit_message_text(message, parse_mode="Markdown", reply_markup=reply_markup)
         return
 
     status = get_client_status(server_id, email)
@@ -849,7 +880,15 @@ async def handle_free_trial(query, data, user_id, context: ContextTypes.DEFAULT_
     try:
         server_id = _resolve_server_id(context, user_id)
         if not server_id:
-            raise Exception("No server configured")
+            raise Exception("سروری موجود نیست")
+
+        srv = get_server(server_id)
+        if srv and srv.get('type') == 'manual':
+            await query.edit_message_text(
+                "❌ دریافت هدیه روی این سرورامکان‌پذیر نیست.",
+                reply_markup=reply_markup
+            )
+            return
 
         client_id, error = create_client(server_id, email, total_bytes, expiry_time)
         if error:
@@ -1386,6 +1425,20 @@ async def handle_admin_server_callback(query, data, user_id, context):
         server_id = data.replace("admin_server_edit_", "")
         await show_admin_server_detail(query, server_id)
 
+    elif data.startswith("admin_server_toggle_type_"):
+        server_id = data.replace("admin_server_toggle_type_", "")
+        srv = get_server(server_id)
+        if srv:
+            new_type = 'manual' if srv.get('type', 'xui') == 'xui' else 'xui'
+            save_server(
+                server_id=srv['server_id'], name=srv['name'], url=srv['url'],
+                username=srv['username'], password=srv['password'], inbound_id=srv['inbound_id'],
+                host=srv.get('host', ''), port=srv.get('port', 443), sni=srv.get('sni', ''),
+                vless_text=srv.get('vless_text', ''), sub_port=srv.get('sub_port', 0),
+                sub_path=srv.get('sub_path', 'sub'), is_active=srv.get('is_active', True),
+                sort_order=srv.get('sort_order', 0), server_type=new_type
+            )
+        await show_admin_server_detail(query, server_id)
 
     elif data.startswith("admin_server_toggle_"):
         server_id = data.replace("admin_server_toggle_", "")
@@ -1437,9 +1490,11 @@ async def show_admin_server_detail(query, server_id):
         )
         return
     status_icon = "✅ فعال" if srv['is_active'] else "❌ غیرفعال"
+    server_type_str = "دستی (Manual)" if srv.get('type') == 'manual' else "اتوماتیک (X-UI)"
     message = (
         f"🖥️ سرور: {srv['name']}\n\n"
         f"🆔 شناسه: {srv['server_id']}\n"
+        f"⚙️ نوع سرور: {server_type_str}\n"
         f"🌐 URL: {srv['url']}\n"
         f"👤 نام کاربری: {srv['username']}\n"
         f"🔌 Inbound: {srv['inbound_id']}\n"
@@ -1851,6 +1906,67 @@ async def handle_support_message(update: Update, context: ContextTypes.DEFAULT_T
         )
         return
 
+    # Admin providing manual config for manual servers
+    if user_id in ADMIN_IDS and context.user_data.get('awaiting_manual_config'):
+        manual_data = context.user_data['awaiting_manual_config']
+        config_text = message_text.strip()
+
+        p_record = manual_data['payment_record']
+        payment_id = manual_data['payment_id']
+        target_user_id = p_record['user_id']
+        plan_gb = float(p_record['plan_gb'] or _parse_plan_gb(p_record['plan']))
+        server_id = manual_data['srv']['server_id']
+        is_extension = p_record['payment_type'] == 'extension'
+
+        update_payment_status(payment_id, 'approved')
+
+        if is_extension:
+            email = p_record['target_email']
+            update_config_total_gb(email, target_user_id, plan_gb)
+            try:
+                await context.bot.send_message(
+                    chat_id=target_user_id,
+                    text=f"✅ درخواست تمدید شما تأیید شد!\n\nاطلاعات سرویس:\n{config_text}",
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                logger.error(e)
+        else:
+            client_id = str(uuid.uuid4())
+            suffix = random_suffix()
+            user_identifier = p_record['username'] if p_record['username'] else str(target_user_id)
+            email = f"{user_identifier}_{suffix}@manual"
+            save_new_config(target_user_id, email, client_id, plan_gb, server_id=server_id)
+
+            # Check referral
+            amount = float(p_record['amount'] or 0)
+            if amount > 0:
+                referral_applied, referrer_user_id, commission_amount = credit_referral_bonus_if_first_service_purchase(
+                    target_user_id, amount)
+                if referral_applied and referrer_user_id:
+                    try:
+                        await context.bot.send_message(chat_id=referrer_user_id,
+                                                       text=f"🎉 دعوت شما باعث اولین خرید یک عضو جدید شد.\n{_format_price_toman(commission_amount)} به کیف پول شما اضافه شد.")
+                    except Exception:
+                        pass
+
+            try:
+                await context.bot.send_message(
+                    chat_id=target_user_id,
+                    text=f"✅ پرداخت شما تأیید شد!\n\nسرویس شما:\n`{config_text}`",
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                logger.error(e)
+
+        await update.message.reply_text(
+            f"✅ کانفیگ دستی برای کاربر `{target_user_id}` ارسال شد و پرداخت تأیید گردید.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔙 بازگشت به لیست", callback_data="admin_pending")]])
+        )
+        del context.user_data['awaiting_manual_config']
+        return
     # Admin send message to specific user flow
     if user_id in ADMIN_IDS and context.user_data.get('awaiting_admin_msg_user'):
         try:
@@ -2440,6 +2556,23 @@ async def approve_payment(query, payment_id, context: ContextTypes.DEFAULT_TYPE)
         await context.bot.send_message(
             chat_id=query.message.chat_id,
             text=f"❌ هیچ سروری برای پردازش این پرداخت یافت نشد.",
+        )
+        return
+    srv = get_server(server_id)
+    is_manual = srv and srv.get('type') == 'manual'
+
+    if is_manual:
+        context.user_data['awaiting_manual_config'] = {
+            'payment_id': payment_id,
+            'payment_record': dict(payment_record),
+            'srv': srv
+        }
+        await query.edit_message_text(
+            f"⚙️ **این پرداخت مربوط به یک سرور دستی (Manual) است.**\n\n"
+            f"لطفاً لینک کانفیگ، سابسکریپشن یا پیام تمدید را برای ارسال به کاربر وارد کنید:\n\n"
+            f"*(پرداخت تا زمان ارسال پیام توسط شما تکمیل نخواهد شد)*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو ارسال", callback_data="admin_pending")]])
         )
         return
 

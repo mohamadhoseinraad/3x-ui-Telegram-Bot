@@ -53,6 +53,12 @@ async def check_and_notify_expiring_configs(bot):
             logger.warning(f"Config {email} has no server_id, skipping")
             continue
 
+        # Ignore manual servers
+        from database import get_server
+        srv = get_server(server_id)
+        if srv and srv.get('type') == 'manual':
+            continue
+
         # Skip if already notified in the last 24 hours
         if last_notified and (datetime.now() - datetime.strptime(last_notified, '%Y-%m-%d %H:%M:%S')).total_seconds() < 86400:
             continue

@@ -193,6 +193,7 @@ def get_admin_server_fields_keyboard(server_id):
     """Keyboard for selecting which specific server field to edit."""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("نام سرور (Name)", callback_data=f"admin_server_setfield_{server_id}_name")],
+        [InlineKeyboardButton("نوع سرور (XUI / Manual)", callback_data=f"admin_server_toggle_type_{server_id}")],
         [InlineKeyboardButton("آدرس پنل (URL)", callback_data=f"admin_server_setfield_{server_id}_url")],
         [InlineKeyboardButton("نام کاربری (Username)", callback_data=f"admin_server_setfield_{server_id}_username"),
          InlineKeyboardButton("رمز عبور (Password)", callback_data=f"admin_server_setfield_{server_id}_password")],

@@ -97,25 +97,33 @@ def init_db():
     # MULTI-SERVER SUPPORT
     # ============================================================
     cursor.execute('''
-    CREATE TABLE IF NOT EXISTS servers (
-        server_id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
-        url TEXT NOT NULL,
-        username TEXT NOT NULL,
-        password TEXT NOT NULL,
-        inbound_id INTEGER NOT NULL DEFAULT 1,
-        host TEXT,
-        port INTEGER DEFAULT 443,
-        sni TEXT,
-        vless_text TEXT,
-        sub_port INTEGER DEFAULT 0,
-        sub_path TEXT DEFAULT 'sub',
-        is_active BOOLEAN DEFAULT TRUE,
-        sort_order INTEGER DEFAULT 0,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-    ''')
+        CREATE TABLE IF NOT EXISTS servers (
+            server_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            url TEXT NOT NULL,
+            username TEXT NOT NULL,
+            password TEXT NOT NULL,
+            inbound_id INTEGER NOT NULL DEFAULT 1,
+            host TEXT,
+            port INTEGER DEFAULT 443,
+            sni TEXT,
+            vless_text TEXT,
+            sub_port INTEGER DEFAULT 0,
+            sub_path TEXT DEFAULT 'sub',
+            is_active BOOLEAN DEFAULT TRUE,
+            sort_order INTEGER DEFAULT 0,
+            type TEXT DEFAULT 'xui',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        ''')
+
+    # Migration for existing servers
+    cursor.execute("PRAGMA table_info(servers)")
+    server_columns = [column_info[1] for column_info in cursor.fetchall()]
+    if 'type' not in server_columns:
+        logger.info("Adding type column to servers table")
+        cursor.execute("ALTER TABLE servers ADD COLUMN type TEXT DEFAULT 'xui'")
 
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS payment_cards (
@@ -1565,10 +1573,9 @@ def get_active_servers():
     conn.close()
     return servers
 
-
 def save_server(server_id, name, url, username, password, inbound_id,
                 host=None, port=443, sni=None, vless_text=None,
-                sub_port=0, sub_path='sub', is_active=True, sort_order=None):
+                sub_port=0, sub_path='sub', is_active=True, sort_order=None, server_type='xui'):
     """Insert or update a server configuration."""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
@@ -1580,8 +1587,8 @@ def save_server(server_id, name, url, username, password, inbound_id,
     cursor.execute(
         '''
         INSERT INTO servers 
-        (server_id, name, url, username, password, inbound_id, host, port, sni, vless_text, sub_port, sub_path, is_active, sort_order, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        (server_id, name, url, username, password, inbound_id, host, port, sni, vless_text, sub_port, sub_path, is_active, sort_order, type, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT(server_id) DO UPDATE SET
             name = excluded.name,
             url = excluded.url,
@@ -1595,17 +1602,17 @@ def save_server(server_id, name, url, username, password, inbound_id,
             sub_port = excluded.sub_port,
             sub_path = excluded.sub_path,
             is_active = excluded.is_active,
+            type = excluded.type,
             updated_at = CURRENT_TIMESTAMP
         ''',
         (server_id, name, url.rstrip('/'), username, password, inbound_id,
          host, port, sni, vless_text, sub_port, sub_path,
-         1 if is_active else 0, sort_order)
+         1 if is_active else 0, sort_order, server_type)
     )
 
     conn.commit()
     conn.close()
     return server_id
-
 
 def delete_server(server_id):
     """Delete a server by ID (only if no configs reference it)."""
