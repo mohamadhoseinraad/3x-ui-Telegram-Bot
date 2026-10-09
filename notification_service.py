@@ -88,6 +88,9 @@ async def check_and_notify_expiring_configs(bot):
 
         remaining_days = status['remaining_days']
         remaining_hours = status['remaining_hours']
+        has_real_expiry = status['expiry_date'] != '1970-01-01'
+        if not has_real_expiry and not notification_needed:
+            continue
 
         if remaining_days <= DAYS_THRESHOLD:
             notification_needed = True
