@@ -21,8 +21,15 @@ from telegram.ext import (
 from telegram import MenuButtonCommands
 
 
-from client_management import show_all_clients, confirm_delete_client, delete_client_handler, cancel_delete_client
-# Import our modules
+from client_management import (
+    show_all_clients,
+    confirm_delete_client,
+    delete_client_handler,
+    cancel_delete_client,
+    start_assign_client,
+    handle_assign_client_message,
+    pick_assign_user,
+)
 from config import BOT_TOKEN, ADMIN_IDS, BOT_ID, IPDOMAIN, PORT, VLESS_TEXT, SUB_PORT, SUB_PATH, HOST, SNI, DB_FILE, \
     ALLOW_BUY, get_payment_msg, DOMAIN
 from database import (
@@ -2940,14 +2947,17 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     """Main function to start the bot"""
-    # Initialize database
     init_db()
 
-    # Create application
-    # application = ApplicationBuilder().token(BOT_TOKEN).build()
-    application = ApplicationBuilder().token(BOT_TOKEN).post_init(set_bot_commands).post_init(set_chat_menu_button).build()
+    application = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .post_init(set_bot_commands)
+        .post_init(set_chat_menu_button)
+        .build()
+    )
 
-    # Add handlers
+    # ---- Command handlers ----
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("referral", referral_command))
     application.add_handler(CommandHandler("wallet", wallet_command))
@@ -2955,20 +2965,48 @@ def main():
     application.add_handler(CommandHandler("broadcast", broadcast_command))
     application.add_handler(CommandHandler("support", support_command))
 
+    # ---- Assign flow: Callback handlers (specific ones first) ----
+    application.add_handler(CallbackQueryHandler(
+        lambda u, c: start_assign_client(
+            u.callback_query,
+            u.callback_query.data.replace("admin_assign_client_", ""),
+            c,
+        ),
+        pattern=r"^admin_assign_client_",
+    ))
+
+    application.add_handler(CallbackQueryHandler(
+        lambda u, c: pick_assign_user(
+            u.callback_query,
+            u.callback_query.data.replace("admin_assign_pick_", "").rsplit("_", 1)[0],
+            int(u.callback_query.data.replace("admin_assign_pick_", "").rsplit("_", 1)[1]),
+            c,
+        ),
+        pattern=r"^admin_assign_pick_",
+    ))
+
+    # ---- Main callback dispatcher (must come AFTER specific ones above) ----
     application.add_handler(CallbackQueryHandler(callback_handler))
 
+    # ---- Media / text ----
     application.add_handler(MessageHandler(filters.PHOTO, handle_receipt))
-    # Add handler for text messages to process support tickets
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_support_message))
+
+    # Single text handler: dispatches internally to assign-flow or support flow
+    async def _text_router(update, context):
+        if context.user_data.get("assign_client_id"):
+            return await handle_assign_client_message(update, context)
+        return await handle_support_message(update, context)
+
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _text_router))
+
     application.add_error_handler(error_handler)
 
-    # Start the notification service
     logger.info("Starting notification service...")
     start_notification_service(application)
 
-    # Start the Bot
     logger.info("Bot started successfully!")
     application.run_polling()
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()

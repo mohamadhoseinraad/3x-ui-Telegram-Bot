@@ -1719,3 +1719,99 @@ def delete_payment_card(card_id):
     cursor.execute('DELETE FROM payment_cards WHERE card_id = ?', (card_id,))
     conn.commit()
     conn.close()
+
+def get_config_by_client_id(client_id):
+    """Return a config row by client_id, or None."""
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    cursor.execute(
+        '''
+        SELECT config_id, user_id, email, client_id, total_gb, is_active, server_id, created_at
+        FROM configs
+        WHERE client_id = ?
+        ''',
+        (client_id,)
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def assign_config_to_user(user_id, email, client_id, total_gb, server_id=None):
+    """Assign an existing (orphan) client to a user by inserting a DB row.
+
+    Returns (success, message).
+    """
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    try:
+        # Refuse if client_id or email already exists
+        cursor.execute('SELECT user_id FROM configs WHERE client_id = ?', (client_id,))
+        row = cursor.fetchone()
+        if row:
+            conn.close()
+            return False, f"این کانفیگ قبلا به کاربر {row[0]} اختصاص داده شده است."
+
+        cursor.execute('SELECT user_id FROM configs WHERE email = ?', (email,))
+        row = cursor.fetchone()
+        if row:
+            conn.close()
+            return False, f"این ایمیل قبلا برای کاربر {row[0]} ثبت شده است."
+
+        cursor.execute(
+            '''
+            INSERT INTO configs (user_id, email, client_id, total_gb, server_id, is_active)
+            VALUES (?, ?, ?, ?, ?, 1)
+            ''',
+            (user_id, email, client_id, total_gb, server_id)
+        )
+        conn.commit()
+        return True, "کانفیگ با موفقیت به کاربر اختصاص یافت."
+    except Exception as e:
+        logger.error(f"Error assigning config {client_id} to user {user_id}: {e}")
+        conn.rollback()
+        return False, str(e)
+    finally:
+        conn.close()
+
+
+def get_user_by_id(user_id):
+    """Return basic user info by Telegram user id."""
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    cursor.execute(
+        'SELECT user_id, username, first_name, last_name FROM users WHERE user_id = ?',
+        (user_id,)
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def search_users(query, limit=20):
+    """Search users by username, first_name, or user_id."""
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    q = f"%{query}%"
+    cursor.execute(
+        '''
+        SELECT user_id, username, first_name, last_name
+        FROM users
+        WHERE CAST(user_id AS TEXT) LIKE ?
+           OR username LIKE ?
+           OR first_name LIKE ?
+        ORDER BY user_id DESC
+        LIMIT ?
+        ''',
+        (q, q, q, limit)
+    )
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return rows
